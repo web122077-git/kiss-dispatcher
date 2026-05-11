@@ -454,7 +454,8 @@ let PERSONAS = null;
 async function loadPersonas() {
   if (PERSONAS) return PERSONAS;
   const fs = await import("node:fs/promises");
-  const text = await fs.readFile("/10310L/repos/persona-config/personas.v7.json", "utf8");
+  const personasPath = process.env.PERSONAS_PATH || "/10310L/repos/persona-config/personas.v7.json";
+  const text = await fs.readFile(personasPath, "utf8");
   const j = JSON.parse(text);
   PERSONAS = {};
   for (const p of j.personas) PERSONAS[p.id] = p;
