@@ -15,6 +15,7 @@ const OLLAMA_URL = (process.env.OLLAMA_URL || "http://10.50.50.11:11434").replac
 const MODEL      = process.env.MODEL      || "qwen3-coder:30b";
 const WORKER_ID  = process.env.WORKER_ID  || `kiss-worker-${process.pid}`;
 const ROLE_HINT  = process.env.ROLE_HINT  || "pm";
+const WORKER_ASSIGNEE_ID = process.env.WORKER_ASSIGNEE_ID || `${process.env.HOMELAB_ENV || "zdev"}-${ROLE_HINT}`;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "2000", 10);
 const NUM_PREDICT = parseInt(process.env.NUM_PREDICT || (
   // Provisional defaults per T2h. Override per worker as needed.
@@ -29,22 +30,51 @@ function log(level, msg, extra) {
 
 // ── Claim & lifecycle helpers (unchanged from spike's two-phase-write version) ──
 
-async function listClaimableTasks() {
-  // /agile/task?status=todo list omits role_hint. Fetch list + GET each item for full props.
-  // api-gap-task-list-include-role-hint-2026-05-11 fixes this server-side later.
-  const r = await fetch(`${CTX_API}/agile/task?status=todo`);
-  if (!r.ok) throw new Error(`list tasks: HTTP ${r.status}`);
-  const wrap = await r.json();
-  const stubs = Array.isArray(wrap) ? wrap : (wrap.items || []);
-  const out = [];
-  for (const stub of stubs) {
-    if (!stub?.id) continue;
-    const tr = await fetch(`${CTX_API}/agile/task/${encodeURIComponent(stub.id)}`);
-    if (!tr.ok) continue;
-    const t = await tr.json();
-    if (t.role_hint === ROLE_HINT && t.status === "todo") out.push(t);
+// T3: claim via server-side endpoint (atomic CAS + worker_assignee_id filter).
+// Replaces the spike-era list-then-PATCH pattern. Server's POST /agile/task/claim
+// already implements assignee_id filtering, role_hint allowlist, model allowlist,
+// and the (:Worker)-[:WORKING_ON]->(:Task) edge for heartbeat-aware eviction.
+async function claimFromServer() {
+  const r = await fetch(`${CTX_API}/agile/task/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      worker_id: WORKER_ID,
+      worker_assignee_id: WORKER_ASSIGNEE_ID,
+      role_allowlist: [ROLE_HINT],
+      model_allowlist: [],  // wildcard — we don't second-guess Task.model_override
+    }),
+  });
+  if (r.status === 204) return null;   // nothing claimable
+  if (!r.ok) {
+    const body = await r.text();
+    throw new Error(`claim HTTP ${r.status}: ${body.slice(0, 200)}`);
   }
-  return out;
+  const t = await r.json();
+  // Server returns the bare claimed Task; fetch full props for the handlers.
+  const fullR = await fetch(`${CTX_API}/agile/task/${encodeURIComponent(t.id)}`);
+  if (!fullR.ok) throw new Error(`post-claim GET HTTP ${fullR.status}`);
+  return await fullR.json();
+}
+
+async function ensureWorkerNode() {
+  // Server-side /agile/task/claim Cypher does MATCH (w:Worker { id: $worker_id })
+  // which fails silently if the node doesn't exist — caller sees 204. We MERGE
+  // the Worker node on boot so claim succeeds idempotently.
+  const r = await fetch(`${CTX_API}/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: `MERGE (w:Worker { id: $id })
+              ON CREATE SET w.created_at = datetime(), w.role_hint = $role,
+                            w.assignee_id = $aid
+              ON MATCH  SET w.last_seen_at = datetime()
+              RETURN w.id AS id`,
+      params: { id: WORKER_ID, role: ROLE_HINT, aid: WORKER_ASSIGNEE_ID },
+    }),
+  });
+  if (!r.ok) throw new Error(`ensureWorkerNode HTTP ${r.status}`);
+  return await r.json();
 }
 
 async function getTaskStatus(taskId) {
@@ -63,14 +93,10 @@ async function patchTask(taskId, body) {
   return { ok: r.ok, status: r.status, body: await r.text() };
 }
 
-async function claimAndRecord(task) {
+// T3: server-side CAS handled the claim. Local bookkeeping records the run.
+async function recordRunStart(task) {
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    const lockR = await client.query("SELECT pg_try_advisory_xact_lock(hashtext($1)) AS got", [task.id]);
-    if (lockR.rows[0]?.got !== true) { await client.query("ROLLBACK"); return { claimed: false, reason: "race-lost" }; }
-    const cur = await getTaskStatus(task.id);
-    if (cur !== "todo") { await client.query("ROLLBACK"); return { claimed: false, reason: `status-changed-to-${cur}` }; }
     await client.query(
       `INSERT INTO dispatcher_runs (task_id, role_hint, worker_id, status)
        VALUES ($1,$2,$3,'doing')
@@ -78,11 +104,8 @@ async function claimAndRecord(task) {
          SET worker_id=$3, claimed_at=now(), status='doing', result=NULL, finished_at=NULL,
              redispatch_count=dispatcher_runs.redispatch_count+1`,
       [task.id, task.role_hint, WORKER_ID]);
-    await client.query("COMMIT");
-    return { claimed: true };
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
-    return { claimed: false, reason: `tx1-error: ${e.message}` };
+    log("warn", "recordRunStart_failed", { taskId: task.id, err: e.message });
   } finally { client.release(); }
 }
 
@@ -449,8 +472,8 @@ function buildUserPrompt(task, persona, hints = {}) {
 // ── Executor — uses the tool loop ──────────────────────────────────────────
 
 async function executeOne(task) {
-  const claim = await claimAndRecord(task);
-  if (!claim.claimed) return { skipped: true, reason: claim.reason };
+  // task is already claimed (status=doing) by the server before we got here.
+  await recordRunStart(task);
 
   try {
     const personas = await loadPersonas();
@@ -463,9 +486,7 @@ async function executeOne(task) {
       { role: "user",   content: buildUserPrompt(task, persona) },
     ];
 
-    // PATCH to doing BEFORE the long model call so the board reflects state immediately.
-    const setDoing = await patchTask(task.id, { status: "doing" });
-    if (!setDoing.ok) throw new Error(`patch doing failed: ${setDoing.status} ${setDoing.body.slice(0,160)}`);
+    // status=doing was set atomically by server's claim — no PATCH needed here.
 
     const chat = await chatWithTools({
       ollamaUrl: OLLAMA_URL,
@@ -551,18 +572,20 @@ async function executeOne(task) {
 }
 
 async function tick() {
-  const tasks = await listClaimableTasks();
-  if (!tasks.length) return { polled: 0 };
-  log("info", "tick", { candidates: tasks.length });
-  for (const t of tasks) {
-    const res = await executeOne(t);
-    log("info", "task_done", { taskId: t.id, res });
-  }
-  return { polled: tasks.length };
+  // T3: claim a single Task per tick. Server returns 204 when nothing matches
+  // this worker's assignee_id + role_allowlist; the poll-loop sleeps and retries.
+  const task = await claimFromServer();
+  if (!task) return { polled: 0 };
+  log("info", "tick_claimed", { taskId: task.id });
+  const res = await executeOne(task);
+  log("info", "task_done", { taskId: task.id, res });
+  return { polled: 1 };
 }
 
 async function main() {
-  log("info", "boot", { role: ROLE_HINT, model: MODEL, ollama: OLLAMA_URL, ctx: CTX_API });
+  log("info", "boot", { role: ROLE_HINT, model: MODEL, assignee_id: WORKER_ASSIGNEE_ID, ollama: OLLAMA_URL, ctx: CTX_API });
+  try { await ensureWorkerNode(); log("info", "worker_node_ready", { id: WORKER_ID }); }
+  catch (e) { log("error", "worker_node_init_failed", { err: e.message }); }
   if (ROLE_HINT === "pm") {
     try { await ensurePushbackSchema(); log("info", "pushback_schema_ready"); }
     catch (e) { log("error", "pushback_schema_init_failed", { err: e.message }); }
