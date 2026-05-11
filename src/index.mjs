@@ -7,6 +7,7 @@
 import pg from "pg";
 import { chatWithTools } from "./ollama.mjs";
 import { toolsForRole } from "./tools.mjs";
+import { PROMPT_BUILDERS, parseOutput } from "./prompts.mjs";
 
 const PG_URL     = process.env.PG_URL     || "postgresql://postgres:kiss-spike-pw@10.98.98.34:5434/dispatcher";
 const CTX_API    = (process.env.CTX_API   || "http://10.77.77.2:3001").replace(/\/$/, "");
@@ -114,27 +115,10 @@ async function loadPersonas() {
 
 // ── Build the user prompt per role ──────────────────────────────────────────
 
-function buildUserPrompt(task, persona) {
-  // Phase 2 T2b will replace this with proper per-role shaping. For T2a we
-  // keep a generic shape that exercises the tool-call loop.
-  return `[TASK]
-${task.title}
-
-[DESCRIPTION]
-${task.description || "(none)"}
-
-[ACCEPTANCE CRITERIA]
-${task.acceptance_criteria || "(none)"}
-
-[YOUR ROLE]
-You are ${persona.label || ROLE_HINT.toUpperCase()}. Per your system prompt, do your job for this Task.
-
-[TOOL USE — read carefully]
-- Use tools to ground your answer in real graph/source state, not to enumerate the catalog.
-- After 1-3 successful tool calls, COMMIT to an answer. Do not keep gathering.
-- If a tool returns 'Nothing found' or 404, the entity does not exist — DO NOT retry with variations of the name; treat the absence as fact and proceed.
-- You may ONLY reference ids that came from a prior tool result. Do NOT invent ids (no epic-42, no node-foo).
-- When you have what you need, emit your final response per your role's output shape and STOP calling tools.`;
+function buildUserPrompt(task, persona, hints = {}) {
+  const builder = PROMPT_BUILDERS[ROLE_HINT];
+  if (!builder) throw new Error(`no prompt builder for role_hint=${ROLE_HINT}`);
+  return builder(task, persona, hints);
 }
 
 // ── Executor — uses the tool loop ──────────────────────────────────────────
@@ -174,6 +158,14 @@ async function executeOne(task) {
     const summary = (chat.finalText || "").trim();
     if (!summary || summary.length < 10) {
       throw new Error(chat.cap_hit ? "tool_loop_cap_hit_no_final_text" : "model reply too short");
+    }
+    const parsed = parseOutput(ROLE_HINT, summary);
+    if (!parsed.ok) {
+      log("warn", "output_parse_failed", { taskId: task.id, err: parsed.error, preview: parsed.preview });
+      // Don't fail the Task on parse fail in T2b — capture parse error in resolution + finishRun
+      // so we can iterate on prompt templates without losing the model's text.
+    } else {
+      log("info", "output_parsed", { taskId: task.id, shape: parsed.shape, has_diff: !!parsed.diff });
     }
 
     const setDone = await patchTask(task.id, {
