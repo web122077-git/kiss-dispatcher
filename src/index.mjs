@@ -8,6 +8,7 @@ import pg from "pg";
 import { chatWithTools } from "./ollama.mjs";
 import { toolsForRole } from "./tools.mjs";
 import { PROMPT_BUILDERS, parseOutput } from "./prompts.mjs";
+import { runTest } from "./test-runner.mjs";
 
 const PG_URL     = process.env.PG_URL     || "postgresql://postgres:kiss-spike-pw@10.98.98.34:5434/dispatcher";
 const CTX_API    = (process.env.CTX_API   || "http://10.77.77.2:3001").replace(/\/$/, "");
@@ -109,13 +110,24 @@ async function recordRunStart(task) {
   } finally { client.release(); }
 }
 
+async function ensureTestOutputCol() {
+  const client = await pool.connect();
+  try {
+    await client.query(`ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS test_output jsonb`);
+  } catch (e) { /* table may not exist yet; non-fatal */ }
+  finally { client.release(); }
+}
+
 async function finishRun(taskId, status, result, extra = {}) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const setTestOutput = extra && extra.test_output !== undefined ? ", test_output=$4" : "";
+    const params = [taskId, status, (result || "").slice(0, 4096)];
+    if (extra && extra.test_output !== undefined) params.push(JSON.stringify(extra.test_output).slice(0, 32768));
     await client.query(
-      `UPDATE dispatcher_runs SET status=$2, result=$3, finished_at=now() WHERE task_id=$1`,
-      [taskId, status, (result || "").slice(0, 4096)]);
+      `UPDATE dispatcher_runs SET status=$2, result=$3, finished_at=now()${setTestOutput} WHERE task_id=$1`,
+      params);
     await client.query("COMMIT");
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
@@ -515,6 +527,33 @@ async function executeOne(task) {
       log("info", "output_parsed", { taskId: task.id, shape: parsed.shape, has_diff: !!parsed.diff });
     }
 
+    // T2g: test-runner — apply diff + run test_command for BE/FE/DO submissions
+    let testRunOutcome = null;
+    if (parsed.ok && parsed.diff && ["be_implementation","fe_implementation","do_runbook","be","fe","do"].includes(parsed.shape || "")) {
+      const targetRepo = parsed.parsed?.target_repo;
+      const testCommand = parsed.parsed?.test_command;
+      if (targetRepo && testCommand) {
+        log("info", "test_runner_start", { taskId: task.id, targetRepo, testCommand });
+        try {
+          testRunOutcome = await runTest({
+            targetRepo, diff: parsed.diff, testCommand,
+            timeoutMs: 300_000, log,
+          });
+          log("info", "test_runner_done", {
+            taskId: task.id,
+            run_status: testRunOutcome.run_status,
+            exit_code: testRunOutcome.exit_code,
+            runtime_seconds: testRunOutcome.runtime_seconds,
+          });
+        } catch (e) {
+          log("error", "test_runner_threw", { taskId: task.id, err: e.message });
+          testRunOutcome = { run_status: "internal_error", stderr: e.message };
+        }
+      } else {
+        log("info", "test_runner_skipped_no_metadata", { taskId: task.id });
+      }
+    }
+
     // T2d: PM pushback interception
     if (parsed.ok && parsed.shape === "pm_pushback" && ROLE_HINT === "pm") {
       const pb = await handlePmPushback(task, parsed);
@@ -564,8 +603,8 @@ async function executeOne(task) {
     });
     if (!setDone.ok) throw new Error(`patch done failed: ${setDone.status} ${setDone.body.slice(0,160)}`);
 
-    await finishRun(task.id, "done", summary);
-    return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length };
+    await finishRun(task.id, "done", summary, testRunOutcome ? { test_output: testRunOutcome } : {});
+    return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, test_runner: testRunOutcome ? { run_status: testRunOutcome.run_status, exit_code: testRunOutcome.exit_code } : null };
   } catch (e) {
     await finishRun(task.id, "failed", String(e.message || e));
     return { ok: false, error: String(e.message || e), taskId: task.id };
@@ -594,6 +633,10 @@ async function main() {
   if (ROLE_HINT === "qa") {
     try { await ensureQaSchema(); log("info", "qa_schema_ready"); }
     catch (e) { log("error", "qa_schema_init_failed", { err: e.message }); }
+  }
+  if (["be","fe","do"].includes(ROLE_HINT)) {
+    try { await ensureTestOutputCol(); log("info", "test_output_col_ready"); }
+    catch (e) { log("error", "test_output_col_init_failed", { err: e.message }); }
   }
   if (process.argv.includes("--once")) {
     await tick();
