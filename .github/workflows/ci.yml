@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Per ADR adr-ci-self-hosted-runner-conventions-2026-05-04: use the
+# homelab github-lxc runner (label: 10310github). Cancellable per ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, 10310github]
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate JSON + workflow YAML
+        run: |
+          python3 -c "import json; json.load(open('package.json'))"
+          python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"
+
+      - name: node --check on all .mjs
+        run: |
+          for f in src/*.mjs; do
+            echo "check: $f"
+            node --check "$f"
+          done
+
+      - name: npm install
+        run: npm install --no-audit --no-fund 2>&1 | tail -5
+
+      - name: Unit test — diffTouchesGoss
+        run: node tests/diff-touches-goss.test.mjs
+
+      - name: Unit test — test-runner
+        run: node tests/test-runner.test.mjs
+
+      - name: Wire-up sanity (no top-level throws on import)
+        run: |
+          # The dispatcher's index.mjs auto-runs main() — we can't import it
+          # without booting it. Instead, syntax-check it (already done above)
+          # and verify the persona-config path is configurable via env.
+          grep -q "PERSONAS_PATH" src/index.mjs
+          grep -q "ensureWorkerNode" src/index.mjs
+          grep -q "handlePmPushback" src/index.mjs
+          grep -q "handleQaVerdict" src/index.mjs
+          grep -q "runTest" src/index.mjs
+          grep -q "diffTouchesGoss" src/index.mjs
+          echo "load-bearing exports present"
