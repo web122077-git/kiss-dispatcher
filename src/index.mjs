@@ -460,6 +460,67 @@ async function handleQaVerdict(task, parsed) {
   return { ok: false, error: `unknown verdict: ${verdict}` };
 }
 
+// ── T2i: DO goss-verify deferral ──────────────────────────────────────────
+// Per decision-do-goss-verify-deferral-2026-05-11 (filed when this lands).
+// When DO emits a diff touching a goss yaml, file a sibling "needs-goss-verify"
+// Task on the same Story (human-applied for now; graduates to a goss-applier
+// worker in Phase 4) so the original Task can resolve cleanly without claiming
+// goss-pass it has not actually verified.
+
+const GOSS_PATH_PATTERNS = [
+  /\/goss\.yaml/i,
+  /\/goss\.yml/i,
+  /\/etc\/goss\//i,
+  /playbooks\/.*goss.*\.ya?ml/i,
+];
+
+function diffTouchesGoss(diff) {
+  if (!diff) return false;
+  // Look at "+++ b/<path>" and "--- a/<path>" lines.
+  const lines = diff.split("\n").filter(l => l.startsWith("+++ ") || l.startsWith("--- "));
+  for (const l of lines) {
+    for (const re of GOSS_PATH_PATTERNS) {
+      if (re.test(l)) return true;
+    }
+  }
+  return false;
+}
+
+async function fileGossVerifyTask(task, parsed) {
+  const newId = `${task.id}-goss-verify`;
+  const description =
+    `DO submitted a diff that touches goss yaml. Per T2i deferral, this sibling Task ` +
+    `holds the verify step until the diff can be applied on the target host(s) and ` +
+    `goss validate is run.\n\n` +
+    `Original DO Task: ${task.id}\n` +
+    `target_repo: ${parsed.parsed?.target_repo || "(unknown)"}\n\n` +
+    `Procedure:\n` +
+    `1. Apply the diff at /opt/<repo> on the target host(s).\n` +
+    `2. Run: sudo goss -g /etc/goss/goss.yaml validate\n` +
+    `3. Paste exit_code + stdout + stderr into this Task's resolution.\n` +
+    `4. Mark done when goss passes; route to BE/FE if goss fails.`;
+  const newTask = {
+    id: newId,
+    title: `DO-VERIFY: run goss after applying ${task.id}`,
+    description,
+    acceptance_criteria: "goss validate runs against the applied diff on at least one target host; exit_code + relevant output captured in this Task's resolution.",
+    role_hint: "do",
+    assignee_id: "chet",  // human-only in Phase 2 per the Decision
+    parent_id: task.parent_id,
+    tags: ["needs-goss-verify", "human-only"],
+  };
+  const r = await fetch(`${CTX_API}/agile/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(newTask),
+  });
+  if (!r.ok) {
+    const body = await r.text();
+    return { ok: false, error: `goss-verify Task POST failed ${r.status}: ${body.slice(0,200)}` };
+  }
+  return { ok: true, newId };
+}
+
 // ── Persona system prompts (loaded from personas.v7.json) ──────────────────
 
 let PERSONAS = null;
@@ -554,6 +615,19 @@ async function executeOne(task) {
       }
     }
 
+    // T2i: DO goss-verify deferral
+    let gossDeferral = null;
+    if (parsed.ok && ROLE_HINT === "do" && parsed.diff && diffTouchesGoss(parsed.diff)) {
+      log("info", "do_goss_deferral_detected", { taskId: task.id });
+      try {
+        gossDeferral = await fileGossVerifyTask(task, parsed);
+        log("info", "do_goss_deferral_filed", { taskId: task.id, ...gossDeferral });
+      } catch (e) {
+        log("error", "do_goss_deferral_threw", { taskId: task.id, err: e.message });
+        gossDeferral = { ok: false, error: e.message };
+      }
+    }
+
     // T2d: PM pushback interception
     if (parsed.ok && parsed.shape === "pm_pushback" && ROLE_HINT === "pm") {
       const pb = await handlePmPushback(task, parsed);
@@ -597,14 +671,15 @@ async function executeOne(task) {
       return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, qa_verdict: qv };
     }
 
+    const gossSuffix = (gossDeferral && gossDeferral.ok) ? ` goss_verify=${gossDeferral.newId}` : "";
     const setDone = await patchTask(task.id, {
       status: "done",
-      resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=${ROLE_HINT} tool_calls=${chat.toolCallsMade.length}] ${summary.slice(0, 480)}`,
+      resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=${ROLE_HINT} tool_calls=${chat.toolCallsMade.length}${gossSuffix}] ${summary.slice(0, 480)}`,
     });
     if (!setDone.ok) throw new Error(`patch done failed: ${setDone.status} ${setDone.body.slice(0,160)}`);
 
     await finishRun(task.id, "done", summary, testRunOutcome ? { test_output: testRunOutcome } : {});
-    return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, test_runner: testRunOutcome ? { run_status: testRunOutcome.run_status, exit_code: testRunOutcome.exit_code } : null };
+    return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, test_runner: testRunOutcome ? { run_status: testRunOutcome.run_status, exit_code: testRunOutcome.exit_code } : null, goss_deferral: gossDeferral };
   } catch (e) {
     await finishRun(task.id, "failed", String(e.message || e));
     return { ok: false, error: String(e.message || e), taskId: task.id };
