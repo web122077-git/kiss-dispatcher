@@ -75,7 +75,11 @@ Second line: "What I am building in this turn: <one sentence>"
 
 Decompose what's MISSING from the existing Story set. If the Epic is already well-decomposed and the only ask is "add Stories for X", scope your work to that gap. Apply scope guard + restate AC.
 
+[PUSHBACK — when you cannot decompose as briefed]
+If the Epic framing has a load-bearing flaw you cannot work around, do NOT emit a low-quality decomposition. Emit shape:"pm_pushback" instead. Pushback MUST name a CONCRETE change CPM should make (not just "this is wrong"). The dispatcher will route your pushback back to CPM and increment a per-Epic counter. Three pushbacks on the same Epic escalate to CLOSER for a Decision — so use pushback only when the framing is genuinely unworkable, not when you would prefer a different phrasing.
+
 [OUTPUT — emit ONE fenced JSON block]
+For a normal decomposition:
 \`\`\`json
 {
   "shape":"epic_decomposition",
@@ -91,6 +95,16 @@ Decompose what's MISSING from the existing Story set. If the Epic is already wel
     }
   ],
   "rationale":"<one short paragraph>"
+}
+\`\`\`
+
+For a pushback to CPM (use sparingly):
+\`\`\`json
+{
+  "shape":"pm_pushback",
+  "epic_id":"<the Epic id you were asked to decompose>",
+  "concrete_change":"<one sentence: what specifically about CPM's framing needs to change>",
+  "reason":"<one paragraph: why you cannot proceed as briefed>"
 }
 \`\`\``;
 }

@@ -100,6 +100,115 @@ async function finishRun(taskId, status, result, extra = {}) {
   } finally { client.release(); }
 }
 
+// ── T2d: PM↔CPM convergence cap ───────────────────────────────────────────
+// Per decision-pm-cpm-convergence-cap-2026-05-11 (filed when this lands).
+// PG-backed counter: cap=3 pushbacks per Epic before escalation to CLOSER.
+
+const PM_PUSHBACK_CAP = parseInt(process.env.PM_PUSHBACK_CAP || "3", 10);
+
+async function ensurePushbackSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pm_pushbacks (
+        id              bigserial PRIMARY KEY,
+        epic_id         text NOT NULL,
+        pm_task_id      text NOT NULL,
+        next_task_id    text,
+        cap_hit         boolean NOT NULL DEFAULT false,
+        concrete_change text NOT NULL,
+        created_at      timestamptz NOT NULL DEFAULT now()
+      )`);
+    await client.query(`CREATE INDEX IF NOT EXISTS pm_pushbacks_epic_idx ON pm_pushbacks(epic_id)`);
+  } finally { client.release(); }
+}
+
+function envPrefixFor(role) {
+  // zdev workers route pushbacks to zdev counterparts; prod to prod.
+  // WORKER_ID convention: zdev-* or prod-* prefix.
+  const env = (WORKER_ID.startsWith("zdev-") || ROLE_HINT.startsWith("zdev-")) ? "zdev" : "prod";
+  return `${env}-${role}`;
+}
+
+async function recordPushbackAndCount(epicId, pmTaskId, concreteChange) {
+  const client = await pool.connect();
+  try {
+    await client.query(`INSERT INTO pm_pushbacks (epic_id, pm_task_id, concrete_change) VALUES ($1,$2,$3)`,
+      [epicId, pmTaskId, concreteChange]);
+    const cR = await client.query(`SELECT COUNT(*)::int AS c FROM pm_pushbacks WHERE epic_id=$1`, [epicId]);
+    return cR.rows[0].c;
+  } finally { client.release(); }
+}
+
+async function setPushbackNextTaskId(pmTaskId, nextTaskId, capHit) {
+  const client = await pool.connect();
+  try {
+    await client.query(`UPDATE pm_pushbacks SET next_task_id=$2, cap_hit=$3 WHERE pm_task_id=$1
+                        AND id = (SELECT MAX(id) FROM pm_pushbacks WHERE pm_task_id=$1)`,
+      [pmTaskId, nextTaskId, capHit]);
+  } finally { client.release(); }
+}
+
+async function handlePmPushback(task, parsed) {
+  const epicId = parsed.parsed?.epic_id || parsed.epic_id;
+  const concreteChange = parsed.parsed?.concrete_change || parsed.concrete_change;
+  const reason = parsed.parsed?.reason || parsed.reason || "(none)";
+  if (!epicId || !concreteChange) {
+    return { ok: false, error: "pm_pushback missing epic_id or concrete_change" };
+  }
+  const count = await recordPushbackAndCount(epicId, task.id, concreteChange);
+  const capHit = count >= PM_PUSHBACK_CAP;
+  const newRole = capHit ? "closer" : "cpm";
+  const newId = `pm-pushback-${task.id}-${count}`;
+
+  const description = capHit
+    ? `PM has pushed back ${count} times on Epic ${epicId}. Per-Epic cap (${PM_PUSHBACK_CAP}) is exceeded.
+
+Latest concrete_change from PM:
+${concreteChange}
+
+Reason:
+${reason}
+
+Write a Decision: either (a) accept PM's concrete_change and update the Epic framing once, or (b) halt the Epic with a Decision capturing why the framing stands. Do NOT route this back to PM — the loop must stop here.`
+    : `PM cannot decompose Epic ${epicId} as currently framed (pushback ${count}/${PM_PUSHBACK_CAP}).
+
+Concrete change requested:
+${concreteChange}
+
+Full reason:
+${reason}
+
+Review the Epic and either: (a) restate the framing addressing concrete_change, OR (b) close the Epic with a Decision explaining why the original framing stands.`;
+
+  const newTask = {
+    id: newId,
+    title: capHit
+      ? `CLOSER: PM↔CPM pushback cap on epic ${epicId}`
+      : `CPM: Address PM pushback ${count}/${PM_PUSHBACK_CAP} on epic ${epicId}`,
+    description,
+    acceptance_criteria: capHit
+      ? "A Decision is filed on this Epic with status accepted or proposed; the PM-Task chain is halted."
+      : "The Epic framing is updated to address concrete_change, OR a Decision is filed explaining why the original framing stands.",
+    role_hint: newRole,
+    assignee_id: envPrefixFor(newRole),
+    parent_id: task.parent_id,
+    tags: ["pm-pushback", capHit ? "cap-hit" : "below-cap"],
+  };
+
+  const r = await fetch(`${CTX_API}/agile/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(newTask),
+  });
+  if (!r.ok) {
+    const body = await r.text();
+    return { ok: false, error: `agile/task POST failed ${r.status}: ${body.slice(0,200)}` };
+  }
+  await setPushbackNextTaskId(task.id, newId, capHit);
+  return { ok: true, count, capHit, newId, newRole };
+}
+
 // ── Persona system prompts (loaded from personas.v7.json) ──────────────────
 
 let PERSONAS = null;
@@ -168,6 +277,27 @@ async function executeOne(task) {
       log("info", "output_parsed", { taskId: task.id, shape: parsed.shape, has_diff: !!parsed.diff });
     }
 
+    // T2d: PM pushback interception
+    if (parsed.ok && parsed.shape === "pm_pushback" && ROLE_HINT === "pm") {
+      const pb = await handlePmPushback(task, parsed);
+      log("info", "pm_pushback_handled", { taskId: task.id, ...pb });
+      if (!pb.ok) {
+        await finishRun(task.id, "failed", `pm_pushback handler error: ${pb.error}`);
+        await patchTask(task.id, {
+          status: "done",
+          resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=pm pm_pushback ERROR=${pb.error}]`,
+        });
+        return { ok: false, taskId: task.id, error: pb.error };
+      }
+      const setDonePb = await patchTask(task.id, {
+        status: "done",
+        resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=pm pm_pushback count=${pb.count}/${PM_PUSHBACK_CAP} cap_hit=${pb.capHit} next=${pb.newId}] ${parsed.parsed?.concrete_change?.slice(0, 320) || ""}`,
+      });
+      if (!setDonePb.ok) throw new Error(`patch done (pushback) failed: ${setDonePb.status}`);
+      await finishRun(task.id, "done", `pm_pushback count=${pb.count} cap_hit=${pb.capHit} next=${pb.newId}`);
+      return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, pm_pushback: pb };
+    }
+
     const setDone = await patchTask(task.id, {
       status: "done",
       resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=${ROLE_HINT} tool_calls=${chat.toolCallsMade.length}] ${summary.slice(0, 480)}`,
@@ -195,6 +325,10 @@ async function tick() {
 
 async function main() {
   log("info", "boot", { role: ROLE_HINT, model: MODEL, ollama: OLLAMA_URL, ctx: CTX_API });
+  if (ROLE_HINT === "pm") {
+    try { await ensurePushbackSchema(); log("info", "pushback_schema_ready"); }
+    catch (e) { log("error", "pushback_schema_init_failed", { err: e.message }); }
+  }
   if (process.argv.includes("--once")) {
     await tick();
     await pool.end();
