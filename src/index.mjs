@@ -209,6 +209,222 @@ Review the Epic and either: (a) restate the framing addressing concrete_change, 
   return { ok: true, count, capHit, newId, newRole };
 }
 
+// ── T2f: QA verdict enforcement (red-flag halt + revise-loop cap) ────────
+// Per decision-qa-redflag-enforcement-2026-05-11 (filed when this lands).
+// Counter is keyed on story_id (the parent Story of the QA Task). Red-flag
+// always escalates to CLOSER regardless of revise count.
+
+const QA_REVISE_CAP = parseInt(process.env.QA_REVISE_CAP || "3", 10);
+
+async function ensureQaSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS qa_verdicts (
+        id                  bigserial PRIMARY KEY,
+        qa_task_id          text NOT NULL,
+        story_id            text,
+        submission_task_id  text,
+        verdict             text NOT NULL,
+        red_flag            text,
+        next_task_id        text,
+        cap_hit             boolean NOT NULL DEFAULT false,
+        created_at          timestamptz NOT NULL DEFAULT now()
+      )`);
+    await client.query(`CREATE INDEX IF NOT EXISTS qa_verdicts_story_idx ON qa_verdicts(story_id)`);
+  } finally { client.release(); }
+}
+
+async function recordQaAndCount(storyId, qaTaskId, submissionTaskId, verdict, redFlag) {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `INSERT INTO qa_verdicts (qa_task_id, story_id, submission_task_id, verdict, red_flag)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [qaTaskId, storyId, submissionTaskId, verdict, redFlag]);
+    const r = await client.query(
+      `SELECT COUNT(*)::int AS c FROM qa_verdicts WHERE story_id=$1 AND verdict='revise' AND (red_flag IS NULL)`,
+      [storyId]);
+    return r.rows[0].c;
+  } finally { client.release(); }
+}
+
+async function setQaNextTaskId(qaTaskId, nextTaskId, capHit) {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE qa_verdicts SET next_task_id=$2, cap_hit=$3 WHERE qa_task_id=$1
+       AND id=(SELECT MAX(id) FROM qa_verdicts WHERE qa_task_id=$1)`,
+      [qaTaskId, nextTaskId, capHit]);
+  } finally { client.release(); }
+}
+
+async function handleQaVerdict(task, parsed) {
+  const p = parsed.parsed || {};
+  const verdict = p.verdict;
+  const redFlag = p.red_flag || null;
+  const defects = Array.isArray(p.defects) ? p.defects : [];
+  const notes = p.notes || "";
+  const storyId = task.parent_id || null;
+  const submissionTaskId = task.metadata?.submission_task_id || null;
+  const submissionRole = task.metadata?.submission_role_hint || "be";
+
+  if (!verdict) return { ok: false, error: "qa_verdict missing verdict" };
+
+  // Approve = no new Task; tag the submission Task if known.
+  if (verdict === "approve" && !redFlag) {
+    await recordQaAndCount(storyId, task.id, submissionTaskId, verdict, null);
+    if (submissionTaskId) {
+      try {
+        await fetch(`${CTX_API}/agile/task/${encodeURIComponent(submissionTaskId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tags: ["qa-approved"] }),
+        });
+      } catch (e) { /* non-fatal */ }
+    }
+    return { ok: true, verdict, newId: null, capHit: false, action: "approved-no-new-task" };
+  }
+
+  // Red-flag = always escalate to CLOSER (show-stopper).
+  if (redFlag) {
+    await recordQaAndCount(storyId, task.id, submissionTaskId, verdict, redFlag);
+    const newId = `qa-redflag-${task.id}-${Date.now()}`;
+    const description =
+      `QA tripped red_flag="${redFlag}" reviewing submission on story ${storyId}.\n\n` +
+      `Verdict: ${verdict}\nDefects: ${JSON.stringify(defects)}\nNotes: ${notes}\n\n` +
+      `Red-flag is a show-stopper. Do NOT route back to the submitter. Write a Decision: ` +
+      `either (a) update the Lesson that named this red_flag if the trade-off is acceptable here, ` +
+      `or (b) close the Story with a Decision capturing why the work cannot proceed.`;
+    const newTask = {
+      id: newId,
+      title: `CLOSER: QA red_flag "${redFlag}" on story ${storyId}`,
+      description,
+      acceptance_criteria: "A Decision is filed on the parent Story or its Epic; the QA-submitter chain is halted.",
+      role_hint: "closer",
+      assignee_id: envPrefixFor("closer"),
+      parent_id: storyId,
+      tags: ["qa-redflag", "halt"],
+    };
+    const r = await fetch(`${CTX_API}/agile/task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newTask),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      return { ok: false, error: `redflag CLOSER POST failed ${r.status}: ${body.slice(0,200)}` };
+    }
+    await setQaNextTaskId(task.id, newId, true);
+    return { ok: true, verdict, redFlag, newId, capHit: true, action: "closer-redflag-halt" };
+  }
+
+  // reject = CLOSER halt
+  if (verdict === "reject") {
+    await recordQaAndCount(storyId, task.id, submissionTaskId, verdict, null);
+    const newId = `qa-reject-${task.id}-${Date.now()}`;
+    const description =
+      `QA returned verdict=reject (core premise unsalvageable).\n` +
+      `Defects: ${JSON.stringify(defects)}\nNotes: ${notes}\n\n` +
+      `Write a Decision: either (a) refine the Story or break it into smaller Stories before re-attempting, ` +
+      `or (b) close the Story with a Decision capturing why the work cannot proceed as defined.`;
+    const newTask = {
+      id: newId,
+      title: `CLOSER: QA rejected submission on story ${storyId}`,
+      description,
+      acceptance_criteria: "A Decision is filed on the parent Story; the QA-submitter chain is halted.",
+      role_hint: "closer",
+      assignee_id: envPrefixFor("closer"),
+      parent_id: storyId,
+      tags: ["qa-reject", "halt"],
+    };
+    const r = await fetch(`${CTX_API}/agile/task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newTask),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      return { ok: false, error: `reject CLOSER POST failed ${r.status}: ${body.slice(0,200)}` };
+    }
+    await setQaNextTaskId(task.id, newId, true);
+    return { ok: true, verdict, newId, capHit: true, action: "closer-reject-halt" };
+  }
+
+  // needs_evidence = re-brief submitter for evidence
+  if (verdict === "needs_evidence") {
+    await recordQaAndCount(storyId, task.id, submissionTaskId, verdict, null);
+    const newId = `qa-needs-evidence-${task.id}-${Date.now()}`;
+    const description =
+      `QA could not approve because evidence was missing.\nNotes: ${notes}\n\n` +
+      `Provide the evidence QA asked for and resubmit. Cite specific lines or graph nodes you read — fabrication is a halt.`;
+    const newTask = {
+      id: newId,
+      title: `${submissionRole.toUpperCase()}: provide evidence (QA needs_evidence)`,
+      description,
+      acceptance_criteria: "Resubmit with concrete evidence citations (file:line or graph-node-id you actually inspected).",
+      role_hint: submissionRole,
+      assignee_id: envPrefixFor(submissionRole),
+      parent_id: storyId,
+      tags: ["qa-needs-evidence"],
+    };
+    const r = await fetch(`${CTX_API}/agile/task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newTask),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      return { ok: false, error: `needs_evidence POST failed ${r.status}: ${body.slice(0,200)}` };
+    }
+    await setQaNextTaskId(task.id, newId, false);
+    return { ok: true, verdict, newId, capHit: false, action: "rebrief-evidence" };
+  }
+
+  // revise = re-brief or cap
+  if (verdict === "revise") {
+    const count = await recordQaAndCount(storyId, task.id, submissionTaskId, verdict, null);
+    const capHit = count >= QA_REVISE_CAP;
+    const newRole = capHit ? "closer" : submissionRole;
+    const newId = `qa-revise-${task.id}-${count}`;
+    const defectLines = defects.map((d, i) => `  ${i + 1}. ${d}`).join("\n");
+    const description = capHit
+      ? `QA has issued ${count} revise verdicts on story ${storyId}. Per-Story cap (${QA_REVISE_CAP}) is exceeded.\n` +
+        `Latest defects: ${JSON.stringify(defects)}\nLatest notes: ${notes}\n\n` +
+        `Write a Decision: either accept the latest submission with the listed defects documented as known issues, ` +
+        `or close the Story with a Decision capturing why convergence cannot be reached.`
+      : `QA requests revision (${count}/${QA_REVISE_CAP}).\nDefects to address (max 2 per QA's policy):\n${defectLines}\n\n` +
+        `Notes from QA: ${notes}\n\nResubmit addressing all listed defects. Do not introduce unrelated changes.`;
+    const newTask = {
+      id: newId,
+      title: capHit
+        ? `CLOSER: QA revise-loop cap on story ${storyId}`
+        : `${submissionRole.toUpperCase()}: revise per QA (${count}/${QA_REVISE_CAP})`,
+      description,
+      acceptance_criteria: capHit
+        ? "A Decision is filed on the parent Story; the revise loop is halted."
+        : "Resubmit addressing the listed defects without introducing scope creep.",
+      role_hint: newRole,
+      assignee_id: envPrefixFor(newRole),
+      parent_id: storyId,
+      tags: capHit ? ["qa-revise", "cap-hit", "halt"] : ["qa-revise"],
+    };
+    const r = await fetch(`${CTX_API}/agile/task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newTask),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      return { ok: false, error: `revise POST failed ${r.status}: ${body.slice(0,200)}` };
+    }
+    await setQaNextTaskId(task.id, newId, capHit);
+    return { ok: true, verdict, count, newId, capHit, action: capHit ? "closer-revise-cap" : "rebrief-submitter" };
+  }
+
+  return { ok: false, error: `unknown verdict: ${verdict}` };
+}
+
 // ── Persona system prompts (loaded from personas.v7.json) ──────────────────
 
 let PERSONAS = null;
@@ -298,6 +514,28 @@ async function executeOne(task) {
       return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, pm_pushback: pb };
     }
 
+    // T2f: QA verdict interception (red-flag halt + revise-loop cap)
+    if (parsed.ok && parsed.shape === "qa_verdict" && ROLE_HINT === "qa") {
+      const qv = await handleQaVerdict(task, parsed);
+      log("info", "qa_verdict_handled", { taskId: task.id, ...qv });
+      if (!qv.ok) {
+        await finishRun(task.id, "failed", `qa_verdict handler error: ${qv.error}`);
+        await patchTask(task.id, {
+          status: "done",
+          resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=qa qa_verdict ERROR=${qv.error}]`,
+        });
+        return { ok: false, taskId: task.id, error: qv.error };
+      }
+      const verdictTag = qv.verdict + (qv.redFlag ? ` red_flag=${qv.redFlag}` : "");
+      const setDoneQv = await patchTask(task.id, {
+        status: "done",
+        resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=qa ${verdictTag} action=${qv.action} next=${qv.newId || "none"} cap_hit=${qv.capHit}]`,
+      });
+      if (!setDoneQv.ok) throw new Error(`patch done (qa) failed: ${setDoneQv.status}`);
+      await finishRun(task.id, "done", `qa_verdict=${qv.verdict} action=${qv.action} cap_hit=${qv.capHit}`);
+      return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, qa_verdict: qv };
+    }
+
     const setDone = await patchTask(task.id, {
       status: "done",
       resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=${ROLE_HINT} tool_calls=${chat.toolCallsMade.length}] ${summary.slice(0, 480)}`,
@@ -328,6 +566,10 @@ async function main() {
   if (ROLE_HINT === "pm") {
     try { await ensurePushbackSchema(); log("info", "pushback_schema_ready"); }
     catch (e) { log("error", "pushback_schema_init_failed", { err: e.message }); }
+  }
+  if (ROLE_HINT === "qa") {
+    try { await ensureQaSchema(); log("info", "qa_schema_ready"); }
+    catch (e) { log("error", "qa_schema_init_failed", { err: e.message }); }
   }
   if (process.argv.includes("--once")) {
     await tick();
