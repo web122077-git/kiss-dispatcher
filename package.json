@@ -1,0 +1,16 @@
+{
+  "name": "kiss-dispatcher",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "KISS PG advisory-lock dispatcher — replaces agile-dispatcher per decision-dispatcher-replace-choice-2026-05-11",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "once": "node src/index.mjs --once"
+  },
+  "dependencies": {
+    "pg": "^8.11.0"
+  },
+  "engines": { "node": ">=20" }
+}
