@@ -39,6 +39,26 @@ sudo bash /opt/kiss-dispatcher/scripts/prod-canary-uninstall.sh
 
 Legacy `agile-dispatcher` remains untouched and continues serving as the prod queue-snapshot SPA. Stopping the canary does NOT take any prod work down — there is no other executor, but doc work simply waits until the canary is restarted or a different executor takes over.
 
+## Sandbox posture (BE/FE/DO roles)
+
+The test-runner subroutine runs inside an ephemeral docker container when
+`KISS_TESTRUNNER_SANDBOX=docker` is set in the role's env file (default in the
+prod-canary-deploy.sh script). Properties:
+
+- `--network=none` — no egress from inside the sandbox. Tests must rely on
+  pre-existing `node_modules` (cp -a from the source repo preserves them).
+- `--read-only` host fs; only `/workspace` (mounted sandbox dir) is rw.
+- `--tmpfs /tmp:exec` for build temp space.
+- `--memory=2g --cpus=2` resource caps.
+- `--cap-drop=ALL --security-opt=no-new-privileges` — no Linux caps, no
+  setuid escalation.
+- Default image: `node:20-slim` (debian-slim with node 20, bash, git).
+  Override per env: `KISS_TESTRUNNER_IMAGE=<image>`.
+
+Repos whose test_command needs `npm install` (no pre-built node_modules) will
+fail under `--network=none`. Either commit node_modules to the source repo or
+file a follow-up Story for narrow egress allow-listing.
+
 ## Known issues (filed)
 
 - `kiss-dispatcher-bug-auto-create-dispatcher-runs-schema-2026-05-11` — schema must be pre-created on a fresh PG (deploy script handles this).

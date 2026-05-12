@@ -124,10 +124,44 @@ export async function runTest({ targetRepo, diff, testCommand, timeoutMs, log })
       }
     }
 
-    // Run the test command. Use bash -lc so the submitter can pass complex commands.
+    // Run the test command. Default: bash -lc on host. Opt-in: docker sandbox
+    // via KISS_TESTRUNNER_SANDBOX=docker. Decision:test-runner-prod-hardening-2026-05-11.
     const tm = Math.min(timeoutMs || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
     if (log) log("info", "test_runner_exec", { testCommand, timeoutMs: tm });
-    const run = await sh("bash", ["-lc", testCommand], { cwd: sandbox, timeoutMs: tm });
+
+    const sandboxMode = process.env.KISS_TESTRUNNER_SANDBOX || "none";
+    let run;
+    if (sandboxMode === "docker") {
+      // Hardened: ephemeral docker container, --network=none, read-only host fs,
+      // tmpfs /tmp, memory + cpu caps, cap-drop ALL, no-new-privileges.
+      // Sandbox dir mounted at /workspace (rw). Test command runs as root inside
+      // the container — defense is namespace isolation, not user-id.
+      // Network egress is OFF; tests must rely on already-cloned node_modules
+      // (cp -a preserves them when the source repo has them). Repos without
+      // pre-built deps will hit "npm install" -> network fail; file as
+      // submitter responsibility (or future Story to allow narrow egress).
+      const image = process.env.KISS_TESTRUNNER_IMAGE || "node:20-slim";
+      const memLimit = process.env.KISS_TESTRUNNER_MEM || "2g";
+      const cpuLimit = process.env.KISS_TESTRUNNER_CPUS || "2";
+      const dockerArgs = [
+        "run", "--rm",
+        "--network=none",
+        "--read-only",
+        `--memory=${memLimit}`,
+        `--cpus=${cpuLimit}`,
+        "--tmpfs", "/tmp:exec",
+        "--cap-drop=ALL",
+        "--security-opt", "no-new-privileges",
+        "-v", `${sandbox}:/workspace:rw`,
+        "-w", "/workspace",
+        image,
+        "bash", "-lc", testCommand,
+      ];
+      if (log) log("info", "test_runner_docker", { image, memLimit, cpuLimit });
+      run = await sh("docker", dockerArgs, { timeoutMs: tm });
+    } else {
+      run = await sh("bash", ["-lc", testCommand], { cwd: sandbox, timeoutMs: tm });
+    }
     result.run_status = run.killed ? "timeout" : (run.ok ? "ok" : "fail");
     result.exit_code = run.exit_code;
     result.stdout = run.stdout;
