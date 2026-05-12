@@ -141,6 +141,30 @@ async function finishRun(taskId, status, result, extra = {}) {
 
 const PM_PUSHBACK_CAP = parseInt(process.env.PM_PUSHBACK_CAP || "3", 10);
 
+// Auto-create dispatcher_runs schema on boot — fixes
+// kiss-dispatcher-bug-auto-create-dispatcher-runs-schema-2026-05-11.
+// Without this, a fresh PG (like the prod canary's kiss-dispatcher-pg)
+// requires operator DDL before the first claim succeeds.
+async function ensureDispatcherRunsSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS dispatcher_runs (
+        task_id          text PRIMARY KEY,
+        role_hint        text,
+        worker_id        text,
+        status           text NOT NULL,
+        result           text,
+        test_output      jsonb,
+        claimed_at       timestamptz NOT NULL DEFAULT now(),
+        finished_at      timestamptz,
+        redispatch_count integer NOT NULL DEFAULT 0
+      )`);
+    await client.query(`CREATE INDEX IF NOT EXISTS dispatcher_runs_status_idx ON dispatcher_runs(status)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS dispatcher_runs_worker_idx ON dispatcher_runs(worker_id)`);
+  } finally { client.release(); }
+}
+
 async function ensurePushbackSchema() {
   const client = await pool.connect();
   try {
@@ -701,6 +725,8 @@ async function main() {
   log("info", "boot", { role: ROLE_HINT, model: MODEL, assignee_id: WORKER_ASSIGNEE_ID, ollama: OLLAMA_URL, ctx: CTX_API });
   try { await ensureWorkerNode(); log("info", "worker_node_ready", { id: WORKER_ID }); }
   catch (e) { log("error", "worker_node_init_failed", { err: e.message }); }
+  try { await ensureDispatcherRunsSchema(); log("info", "dispatcher_runs_schema_ready"); }
+  catch (e) { log("error", "dispatcher_runs_schema_init_failed", { err: e.message }); }
   if (ROLE_HINT === "pm") {
     try { await ensurePushbackSchema(); log("info", "pushback_schema_ready"); }
     catch (e) { log("error", "pushback_schema_init_failed", { err: e.message }); }
@@ -719,6 +745,7 @@ async function main() {
     return;
   }
   for (;;) {
+    try { await ensureWorkerNode(); } catch (e) { log("warn", "heartbeat_failed", { err: e.message }); }
     try { await tick(); } catch (e) { log("error", "tick_err", { err: e.message }); }
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
