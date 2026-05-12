@@ -596,6 +596,10 @@ async function executeOne(task) {
         top_p:       persona.top_p       ?? 0.85,
         num_predict: NUM_PREDICT,
       },
+      // openclaw and other OpenAI-compatible backends (Story:openclaw-as-peer-persona-2026-05-12).
+      // The persona may declare api_shape: 'openai' / 'openai_compat'; env fallback supported.
+      apiShape: persona.api_shape || process.env.API_SHAPE,
+      authBearer: process.env.GATEWAY_BEARER,
       log,
     });
 

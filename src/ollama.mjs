@@ -6,8 +6,15 @@ import { executeTool } from "./tools.mjs";
 // Per-role max iterations — planners stop fast, coders may need more context-gathering.
 // Smoke 2026-05-11 found qwen3-coder:30b chains 45 tool calls when cap is 8; cap of 4
 // forces planner roles to commit. Coder roles still get 6 to read multiple files.
-const MAX_ITERATIONS_BY_ROLE = { cpm: 4, pm: 4, tl: 6, be: 6, fe: 6, do: 6, qa: 4, doc: 4, closer: 5 };
+const MAX_ITERATIONS_BY_ROLE = { cpm: 4, pm: 4, tl: 6, be: 6, fe: 6, do: 6, qa: 4, doc: 4, closer: 5, openclaw: 4 };
 const MAX_ITERATIONS_DEFAULT = 4;
+
+// API shape: kiss-dispatcher speaks Ollama-native /api/chat by default. When
+// the persona's ollamaUrl is the openclaw gateway (or any OpenAI-compatible
+// endpoint), the dispatcher must POST to /v1/chat/completions and unwrap the
+// OpenAI response shape (choices[0].message instead of message). The persona's
+// api_shape field or ollamaUrl bearer token are passed through opts.
+
 const PER_CALL_TIMEOUT_MS = 180_000; // 3 min per /api/chat round-trip
 
 /**
@@ -22,34 +29,48 @@ const PER_CALL_TIMEOUT_MS = 180_000; // 3 min per /api/chat round-trip
  * @param {(level,msg,extra)=>void} [args.log]
  * @returns {Promise<{messages, finalText, iterations, toolCallsMade}>}
  */
-export async function chatWithTools({ ollamaUrl, model, messages, tools, options = {}, log }) {
+export async function chatWithTools({ ollamaUrl, model, messages, tools, options = {}, log, apiShape, authBearer }) {
   const conv = messages.slice();
   const toolCallsMade = [];
   let iteration = 0;
+  // Default to Ollama-native unless persona/env says otherwise.
+  const shape = (apiShape || process.env.API_SHAPE || "ollama").toLowerCase();
+  const useOpenAI = shape === "openai" || shape === "openai_compat";
+  const chatPath = useOpenAI ? "/v1/chat/completions" : "/api/chat";
 
   const MAX_ITERATIONS = MAX_ITERATIONS_BY_ROLE[process.env.ROLE_HINT] ?? MAX_ITERATIONS_DEFAULT;
   while (iteration < MAX_ITERATIONS) {
     iteration += 1;
-    const body = {
-      model,
-      messages: conv,
-      stream: false,
-      options,
-    };
-    if (tools && tools.length) body.tools = tools;
+    // Build the per-shape body. OpenAI variant: max_tokens instead of options.num_predict;
+    // top-level temperature/top_p instead of options.{...}.
+    let body;
+    if (useOpenAI) {
+      body = { model, messages: conv, stream: false };
+      if (options.temperature !== undefined) body.temperature = options.temperature;
+      if (options.top_p !== undefined) body.top_p = options.top_p;
+      if (options.num_predict !== undefined) body.max_tokens = options.num_predict;
+      if (tools && tools.length) body.tools = tools;
+    } else {
+      body = { model, messages: conv, stream: false, options };
+      if (tools && tools.length) body.tools = tools;
+    }
 
     const ctrl = new AbortController();
     const tm = setTimeout(() => ctrl.abort("ollama timeout"), PER_CALL_TIMEOUT_MS);
     let resp;
     try {
-      const r = await fetch(`${ollamaUrl}/api/chat`, {
+      const headers = { "Content-Type": "application/json" };
+      if (useOpenAI && authBearer) headers["Authorization"] = `Bearer ${authBearer}`;
+      const r = await fetch(`${ollamaUrl}${chatPath}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
-      if (!r.ok) throw new Error(`ollama HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
-      resp = await r.json();
+      if (!r.ok) throw new Error(`chat HTTP ${r.status} via ${chatPath}: ${(await r.text()).slice(0, 200)}`);
+      const j = await r.json();
+      // Normalize: lift OpenAI choices[0].message into Ollama-shape resp.message.
+      resp = useOpenAI ? { message: j?.choices?.[0]?.message ?? {} } : j;
     } finally {
       clearTimeout(tm);
     }
