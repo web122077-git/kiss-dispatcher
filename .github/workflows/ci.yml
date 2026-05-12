@@ -44,6 +44,9 @@ jobs:
       - name: Unit test — parser fallback (prompt-eng-pm-output-shape)
         run: node tests/parser-fallback.test.mjs
 
+      - name: Unit test — openclaw-tools allow-list gating (T4 openclaw-spike-zdev-2026-05)
+        run: node tests/openclaw-tools.test.mjs
+
       - name: Wire-up sanity (no top-level throws on import)
         run: |
           # The dispatcher's index.mjs auto-runs main() — we can't import it

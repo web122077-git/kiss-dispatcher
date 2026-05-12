@@ -38,6 +38,17 @@ for role in "${ROLES[@]}"; do
   chmod 0640 "$envfile"
 done
 
+# T4 (openclaw-spike-zdev-2026-05): keep DO env's OPENCLAW_MCP_* lines fresh.
+OPENCLAW_MCP_URL_DEFAULT=${OPENCLAW_MCP_URL_DEFAULT:-http://10.98.98.33:3000}
+OPENCLAW_MCP_TOKEN_DEFAULT=${OPENCLAW_MCP_TOKEN_DEFAULT:-}
+do_env="$ENV_DIR/do.env"
+grep -v -E '^OPENCLAW_MCP_(URL|TOKEN)=' "$do_env" > "$do_env.new" || true
+echo "OPENCLAW_MCP_URL=$OPENCLAW_MCP_URL_DEFAULT" >> "$do_env.new"
+echo "OPENCLAW_MCP_TOKEN=$OPENCLAW_MCP_TOKEN_DEFAULT" >> "$do_env.new"
+mv "$do_env.new" "$do_env"
+chmod 0640 "$do_env"
+echo "  DO env refreshed with OPENCLAW_MCP_URL=$OPENCLAW_MCP_URL_DEFAULT"
+
 echo "== 4. Restart workers =="
 systemctl daemon-reload
 for role in "${ROLES[@]}"; do

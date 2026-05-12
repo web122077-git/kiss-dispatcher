@@ -60,6 +60,19 @@ EOF
   chmod 0640 "$envfile"
 done
 
+# T4 (openclaw-spike-zdev-2026-05): DO worker gets openclaw-mcp tools.
+# Only DO advertises openclaw_chat_async / openclaw_task_status / openclaw_task_cancel.
+# Other roles' envs are unchanged so their allow-lists exclude these tools.
+OPENCLAW_MCP_URL_DEFAULT=${OPENCLAW_MCP_URL_DEFAULT:-http://10.98.98.33:3000}
+OPENCLAW_MCP_TOKEN_DEFAULT=${OPENCLAW_MCP_TOKEN_DEFAULT:-}
+do_env="$ENV_DIR/do.env"
+grep -v -E '^OPENCLAW_MCP_(URL|TOKEN)=' "$do_env" > "$do_env.new" || true
+echo "OPENCLAW_MCP_URL=$OPENCLAW_MCP_URL_DEFAULT" >> "$do_env.new"
+echo "OPENCLAW_MCP_TOKEN=$OPENCLAW_MCP_TOKEN_DEFAULT" >> "$do_env.new"
+mv "$do_env.new" "$do_env"
+chmod 0640 "$do_env"
+echo "  DO env injected with OPENCLAW_MCP_URL=$OPENCLAW_MCP_URL_DEFAULT"
+
 echo "== 4. Systemd template =="
 cat > "$ETC_SYSTEMD/kiss-dispatcher@.service" <<'EOF'
 [Unit]

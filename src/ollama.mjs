@@ -73,7 +73,7 @@ export async function chatWithTools({ ollamaUrl, model, messages, tools, options
       }
       args = args || {};
       log?.("info", "tool_call", { iteration, name, args });
-      const result = await executeTool(name, args);
+      const result = await executeTool(name, args, process.env.ROLE_HINT);
       toolCallsMade.push({ iteration, name, args, result_len: typeof result === "string" ? result.length : 0 });
       conv.push({
         role: "tool",
