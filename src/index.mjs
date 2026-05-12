@@ -581,7 +581,7 @@ async function executeOne(task) {
     const tools = toolsForRole(ROLE_HINT);
     const messages = [
       { role: "system", content: persona.system_prompt },
-      { role: "user",   content: buildUserPrompt(task, persona) },
+      { role: "user",   content: buildUserPrompt(task, persona, { effective_tools: tools.map(t => t?.function?.name).filter(Boolean) }) },
     ];
 
     // status=doing was set atomically by server's claim — no PATCH needed here.

@@ -162,6 +162,30 @@ Emit ONE fenced JSON block:
 // ── BE / FE / DO — implementer ────────────────────────────────────────────
 
 function buildImplementerPrompt(task, persona, hints, roleLabel) {
+  // Detect doer-surface tools in the persona's allow-list. When present, DO must
+  // delegate to the doer FIRST instead of writing an implementer-shape narrative —
+  // see Task openclaw-spike-do-prompt-blocks-tool-calls-2026-05-11.
+  // Prefer effective tools from hints (kiss-dispatcher injects the toolsForRole list)
+  // and fall back to the persona-config static list when not provided.
+  const toolNames = (hints?.effective_tools && hints.effective_tools.length
+    ? hints.effective_tools
+    : (persona?.tools || []).map(t => (typeof t === "string" ? t : t?.name)).filter(Boolean));
+  const doerSurfaceTools = toolNames.filter(n => /^openclaw_(chat_async|task_status|task_cancel)$/.test(n));
+  const hasDoerSurface = doerSurfaceTools.length > 0;
+
+  const toolFirstBlock = hasDoerSurface ? `
+[TOOL-FIRST — doer surface available]
+Your allow-list includes: ${doerSurfaceTools.join(", ")}.
+When the Task's "what I am building" is the kind of work those tools exist to delegate
+(infra/code changes a remote doer can execute on your behalf), your FIRST action this turn
+MUST be a tool_call to openclaw_chat_async. Do NOT emit the "Story acceptance criteria as I
+read them..." narrative until at least one tool_call has been made. After the tool result
+arrives (or you have captured an openclaw_task_id), write the implementer-shape (diff + JSON)
+summarising the delegation and including \`openclaw_task_id\` in the JSON block. If after
+inspection the work genuinely cannot be delegated (e.g. it is the doer surface itself),
+say so explicitly in your first narrative line and proceed with a direct implementation.
+` : "";
+
   return `[STORY]
 ${hints?.story?.title || task.title}
 acceptance_criteria: ${hints?.story?.acceptance_criteria || task.acceptance_criteria || "(none)"}
@@ -173,8 +197,9 @@ ${hints?.tl_brief || task.description || "(missing — file a clarification requ
 ${hints?.repo_context || "(use file_tree + file_read against the target_repo from the brief)"}
 
 ${COMMON_STOP_GUIDANCE}
-
+${toolFirstBlock}
 [YOUR JOB — ${roleLabel} implementer]
+${hasDoerSurface ? "If you delegated via openclaw_chat_async above, the narrative + diff describes the delegation (what you asked the doer to do, against which target_repo); include `openclaw_task_id` in the JSON. Otherwise:" : ""}
 First line: "Story acceptance criteria as I read them: <bulleted list>"
 Second line: "What I am building in this turn: <one sentence>"
 
