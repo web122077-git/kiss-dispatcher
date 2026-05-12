@@ -58,13 +58,13 @@ for (const name of ["openclaw_chat_async", "openclaw_task_status", "openclaw_tas
 }
 
 // openclaw_chat_async required: prompt
-check("openclaw_chat_async requires prompt", TOOL_SCHEMAS.openclaw_chat_async.function.parameters.required, ["prompt"]);
+check("openclaw_chat_async requires message", TOOL_SCHEMAS.openclaw_chat_async.function.parameters.required, ["message"]);
 check("openclaw_task_status requires task_id", TOOL_SCHEMAS.openclaw_task_status.function.parameters.required, ["task_id"]);
 check("openclaw_task_cancel requires task_id", TOOL_SCHEMAS.openclaw_task_cancel.function.parameters.required, ["task_id"]);
 
 // ── Allow-list enforcement at executeTool ────────────────────────────────
 // PM trying openclaw_chat_async (role gate rejects before exec):
-const pmTry = await executeTool("openclaw_chat_async", { prompt: "hi" }, "pm");
+const pmTry = await executeTool("openclaw_chat_async", { message: "hi" }, "pm");
 const pmTryJ = JSON.parse(pmTry);
 check("executeTool: PM is rejected by allow-list", pmTryJ.ok, false);
 checkTrue("executeTool: PM rejection mentions allow-list", String(pmTryJ.error || "").includes("allow-list"));
@@ -73,13 +73,13 @@ checkTrue("executeTool: PM rejection mentions allow-list", String(pmTryJ.error |
 // import time, since ROLE_TOOLS.do was built with no env at module load.
 // (process.env.OPENCLAW_MCP_URL was NOT set when this file imported tools.mjs.)
 // Confirms the boot-time gate works:
-const doImportGate = await executeTool("openclaw_chat_async", { prompt: "hi" }, "do");
+const doImportGate = await executeTool("openclaw_chat_async", { message: "hi" }, "do");
 const doImportGateJ = JSON.parse(doImportGate);
 check("executeTool: DO without env is also rejected (boot-time gate)", doImportGateJ.ok, false);
 
 // Bypassing role hint (back-compat): executor lookup should still hit the openclaw
 // branch and return the "not configured" message because env is unset.
-const noRole = await executeTool("openclaw_chat_async", { prompt: "hi" });
+const noRole = await executeTool("openclaw_chat_async", { message: "hi" });
 const noRoleJ = JSON.parse(noRole);
 check("executeTool: no role hint → falls through to executor", noRoleJ.ok, false);
 checkTrue("executeTool: no-env executor returns 'openclaw not configured'", String(noRoleJ.error || "").includes("openclaw not configured"));

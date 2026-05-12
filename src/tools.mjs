@@ -145,15 +145,16 @@ export const TOOL_SCHEMAS = {
     type: "function",
     function: {
       name: "openclaw_chat_async",
-      description: "Submit an async chat request via OpenClaw (self-hosted Claude.ai bridge). Returns a task_id; poll openclaw_task_status until done. Use when a Task needs the Claude.ai chat surface (web search, MCP-equipped Claude conversation, agentic tool use) rather than the local Ollama model.",
+      description: "Submit an async chat request via OpenClaw (self-hosted Claude.ai bridge). Returns a task_id immediately; poll openclaw_task_status to get the result. Use when a Task needs the Claude.ai chat surface (web search, MCP-equipped Claude conversation, agentic tool use) rather than the local Ollama model.",
       parameters: {
         type: "object",
         properties: {
-          prompt: { type: "string", description: "The chat prompt to send to Claude.ai via OpenClaw." },
-          target: { type: "string", description: "Optional chat target id (project/conversation). Omit for default." },
-          model: { type: "string", description: "Optional model override (e.g. 'claude-opus-4-6'). Omit for default." }
+          message: { type: "string", description: "The message to send to OpenClaw / Claude." },
+          session_id: { type: "string", description: "Optional session id to thread the message into an existing conversation." },
+          priority: { type: "number", description: "Task priority (higher = processed first). Default: 0." },
+          instance: { type: "string", description: "Optional OpenClaw instance name. Defaults to the configured default instance." }
         },
-        required: ["prompt"]
+        required: ["message"]
       }
     }
   },
@@ -250,48 +251,182 @@ async function fileTree(p) {
 }
 
 // ── OpenClaw MCP bridge call ────────────────────────────────────────────
-// Stateless POST to ${OPENCLAW_MCP_URL}/mcp using MCP HTTP transport
-// (JSON-RPC 2.0, method=tools/call). Bearer token from OPENCLAW_MCP_TOKEN.
-// If OPENCLAW_MCP_URL is unset, returns a configured-no error rather than
-// crashing — defensive against an OPENCLAW_MCP_URL-less DO worker (which
-// should not be calling these tools, but kiss-dispatcher avoids hard fails
-// on env drift).
+// Full OAuth 2.1 PKCE + MCP HTTP transport. The freema/openclaw-mcp bridge
+// has AUTH_ENABLED=true and only advertises authorization_code/refresh_token
+// grants — so a backend caller has to do the PKCE handshake even though
+// nobody types a password. Once we hold a bearer token, MCP requires:
+//   1. POST /mcp { method:'initialize' } → response carries Mcp-Session-Id
+//   2. POST /mcp { method:'notifications/initialized' } on that session
+//   3. POST /mcp { method:'tools/call', params:{name, arguments} } on that session
+//
+// We memoize the token+session at module scope so subsequent tool_calls in a
+// single Ollama loop reuse them. On 401 we drop and re-auth once.
+
+import { createHash, randomBytes } from "node:crypto";
+
 const OPENCLAW_TIMEOUT_MS = 30_000;
+const REDIRECT_URI = "http://localhost/cb";
 
-async function openclawMcpCall(toolName, args) {
-  const url = (process.env.OPENCLAW_MCP_URL || "").replace(/\/$/, "");
-  const token = process.env.OPENCLAW_MCP_TOKEN || "";
-  if (!url) return { ok: false, error: "openclaw not configured (OPENCLAW_MCP_URL unset)" };
+let _ocToken = null;
+let _ocSession = null;
+let _ocInitPromise = null;
 
+function _b64url(buf) {
+  return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function _ocGetToken(url) {
+  const clientId = process.env.OPENCLAW_MCP_CLIENT_ID || "openclaw";
+  const clientSecret = process.env.OPENCLAW_MCP_CLIENT_SECRET || "";
+  if (!clientSecret) throw new Error("OPENCLAW_MCP_CLIENT_SECRET unset");
+
+  const verifier = _b64url(randomBytes(48));
+  const challenge = _b64url(createHash("sha256").update(verifier).digest());
+
+  // Step 1: POST /authorize → 302 with ?code=...
+  const authParams = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: REDIRECT_URI,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    scope: "mcp:tools",
+  });
+  const authResp = await fetch(`${url}/authorize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: authParams.toString(),
+    redirect: "manual",
+  });
+  const loc = authResp.headers.get("location") || "";
+  const m = loc.match(/[?&]code=([^&]+)/);
+  if (!m) throw new Error(`no auth code in redirect; loc=${loc.slice(0,200)} status=${authResp.status}`);
+  const code = decodeURIComponent(m[1]);
+
+  // Step 2: POST /token → access_token
+  const tokParams = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: REDIRECT_URI,
+    code_verifier: verifier,
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+  const tokResp = await fetch(`${url}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: tokParams.toString(),
+  });
+  const tokJson = await tokResp.json().catch(() => null);
+  if (!tokJson || !tokJson.access_token) throw new Error(`token grant failed: ${JSON.stringify(tokJson)}`);
+  return tokJson.access_token;
+}
+
+async function _ocInitSession(url, token) {
   const headers = {
+    "Authorization": `Bearer ${token}`,
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
   };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const initResp = await fetch(`${url}/mcp`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "init",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "kiss-dispatcher", version: "0.1" },
+      },
+    }),
+  });
+  const session = initResp.headers.get("mcp-session-id");
+  if (!session) {
+    const body = (await initResp.text()).slice(0, 400);
+    throw new Error(`no Mcp-Session-Id in init response: ${body}`);
+  }
+  await initResp.text().catch(() => null); // drain
 
-  const body = {
-    jsonrpc: "2.0",
-    id: Date.now().toString(),
-    method: "tools/call",
-    params: { name: toolName, arguments: args || {} },
-  };
+  // notifications/initialized — required by MCP spec before any other call
+  await fetch(`${url}/mcp`, {
+    method: "POST",
+    headers: { ...headers, "Mcp-Session-Id": session },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+  });
+  return session;
+}
+
+async function _ocEnsureSession(url) {
+  if (_ocToken && _ocSession) return { token: _ocToken, session: _ocSession };
+  if (_ocInitPromise) return _ocInitPromise;
+  _ocInitPromise = (async () => {
+    const token = await _ocGetToken(url);
+    const session = await _ocInitSession(url, token);
+    _ocToken = token;
+    _ocSession = session;
+    return { token, session };
+  })();
+  try { return await _ocInitPromise; }
+  finally { _ocInitPromise = null; }
+}
+
+function _parseMcpResponse(text) {
+  // openclaw-mcp returns SSE-shaped 'event: message\ndata: {...}'. Handle both
+  // SSE and plain JSON for portability.
+  if (text && /^event:|\ndata:/.test(text)) {
+    const m = text.match(/data:\s*(\{[\s\S]*\})/);
+    if (m) { try { return JSON.parse(m[1]); } catch (_) { /* fall through */ } }
+  }
+  try { return JSON.parse(text); } catch (_) { return null; }
+}
+
+async function openclawMcpCall(toolName, args, retry = 1) {
+  const url = (process.env.OPENCLAW_MCP_URL || "").replace(/\/$/, "");
+  if (!url) return { ok: false, error: "openclaw not configured (OPENCLAW_MCP_URL unset)" };
+
+  let sess;
+  try {
+    sess = await _ocEnsureSession(url);
+  } catch (e) {
+    return { ok: false, error: `openclaw auth failed: ${e.message || String(e)}` };
+  }
 
   const ctrl = new AbortController();
   const tm = setTimeout(() => ctrl.abort("openclaw-mcp timeout"), OPENCLAW_TIMEOUT_MS);
   try {
     const r = await fetch(`${url}/mcp`, {
       method: "POST",
-      headers,
-      body: JSON.stringify(body),
+      headers: {
+        "Authorization": `Bearer ${sess.token}`,
+        "Mcp-Session-Id": sess.session,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: Date.now().toString(),
+        method: "tools/call",
+        params: { name: toolName, arguments: args || {} },
+      }),
       signal: ctrl.signal,
     });
+    if ((r.status === 401 || r.status === 404) && retry > 0) {
+      // token expired / session evicted — drop and retry once
+      _ocToken = null;
+      _ocSession = null;
+      return openclawMcpCall(toolName, args, retry - 1);
+    }
     if (!r.ok) {
       const text = (await r.text()).slice(0, 400);
       return { ok: false, status: r.status, error: `openclaw-mcp HTTP ${r.status}`, body: text };
     }
-    const j = await r.json().catch(() => null);
-    if (j && j.error) return { ok: false, error: j.error.message || String(j.error), code: j.error.code };
-    return { ok: true, result: j ? j.result : null };
+    const text = await r.text();
+    const payload = _parseMcpResponse(text);
+    if (!payload) return { ok: false, error: "unparseable openclaw response", body: text.slice(0, 400) };
+    if (payload.error) return { ok: false, error: payload.error.message || String(payload.error), code: payload.error.code };
+    return { ok: true, result: payload.result || null };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
   } finally {

@@ -42,9 +42,11 @@ done
 OPENCLAW_MCP_URL_DEFAULT=${OPENCLAW_MCP_URL_DEFAULT:-http://10.98.98.33:3000}
 OPENCLAW_MCP_TOKEN_DEFAULT=${OPENCLAW_MCP_TOKEN_DEFAULT:-}
 do_env="$ENV_DIR/do.env"
-grep -v -E '^OPENCLAW_MCP_(URL|TOKEN)=' "$do_env" > "$do_env.new" || true
+grep -v -E '^OPENCLAW_MCP_(URL|TOKEN|CLIENT_ID|CLIENT_SECRET)=' "$do_env" > "$do_env.new" || true
 echo "OPENCLAW_MCP_URL=$OPENCLAW_MCP_URL_DEFAULT" >> "$do_env.new"
 echo "OPENCLAW_MCP_TOKEN=$OPENCLAW_MCP_TOKEN_DEFAULT" >> "$do_env.new"
+echo "OPENCLAW_MCP_CLIENT_ID=${OPENCLAW_MCP_CLIENT_ID:-openclaw}" >> "$do_env.new"
+echo "OPENCLAW_MCP_CLIENT_SECRET=${OPENCLAW_MCP_CLIENT_SECRET:-}" >> "$do_env.new"
 mv "$do_env.new" "$do_env"
 chmod 0640 "$do_env"
 echo "  DO env refreshed with OPENCLAW_MCP_URL=$OPENCLAW_MCP_URL_DEFAULT"
