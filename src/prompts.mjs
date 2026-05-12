@@ -223,6 +223,9 @@ If you decide your draft trips a red_flag (per your system_prompt), DO NOT submi
 export const buildBePrompt = (t, p, h) => buildImplementerPrompt(t, p, h, "be");
 export const buildFePrompt = (t, p, h) => buildImplementerPrompt(t, p, h, "fe");
 export const buildDoPrompt = (t, p, h) => buildImplementerPrompt(t, p, h, "do");
+// openclaw is a peer persona that produces the same implementer envelope as DO/BE/FE.
+// The gateway runs its own agent loop, so the dispatcher just hands it the brief.
+export const buildOpenclawPrompt = (t, p, h) => buildImplementerPrompt(t, p, h, "openclaw");
 
 // ── QA — reviewer ────────────────────────────────────────────────────────
 
@@ -315,6 +318,7 @@ export const PROMPT_BUILDERS = {
   qa:  buildQaPrompt,
   doc: buildDocPrompt,
   closer: buildCloserPrompt,
+  openclaw: buildOpenclawPrompt,
 };
 
 // ── Output parser ─────────────────────────────────────────────────────────

@@ -201,6 +201,11 @@ export function buildRoleTools(env) {
     qa:     ["xray","nodes_q","host","service","file_read"],                       // file-read constrained: only for citation-substantiation per Chet
     doc:    ["file_read","file_tree","decision_recent","decision_get"],
     closer: ["xray","decision_recent","decision_get","agile_epic_get","agile_story_get","agile_task_get"],
+    // openclaw is a peer persona (Story:openclaw-as-peer-persona-2026-05-12). The dispatcher
+    // calls the gateway like any other Ollama endpoint; the gateway has its own agent loop +
+    // tools, so we only inject lightweight read tools here so the dispatcher's ollama.mjs path
+    // works without a tool-shape error. Effective allow-list is small on purpose.
+    openclaw: ["xray","nodes_q","host","service","file_read","file_tree"],
   };
   // Phase 4 Track 2: DO gets openclaw_* tools when OPENCLAW_MCP_URL is set.
   // Prod DO workers (env unset) keep the original allow-list unchanged.
