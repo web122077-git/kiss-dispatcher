@@ -70,16 +70,13 @@ ${task.description || "(none)"}
 ${COMMON_STOP_GUIDANCE}
 
 [YOUR JOB]
-First line: "Story acceptance criteria as I read them: <bulleted list of the Task's AC>"
-Second line: "What I am building in this turn: <one sentence>"
-
 Decompose what's MISSING from the existing Story set. If the Epic is already well-decomposed and the only ask is "add Stories for X", scope your work to that gap. Apply scope guard + restate AC.
 
 [PUSHBACK — when you cannot decompose as briefed]
 If the Epic framing has a load-bearing flaw you cannot work around, do NOT emit a low-quality decomposition. Emit shape:"pm_pushback" instead. Pushback MUST name a CONCRETE change CPM should make (not just "this is wrong"). The dispatcher will route your pushback back to CPM and increment a per-Epic counter. Three pushbacks on the same Epic escalate to CLOSER for a Decision — so use pushback only when the framing is genuinely unworkable, not when you would prefer a different phrasing.
 
-[OUTPUT — emit ONE fenced JSON block]
-For a normal decomposition:
+[YOUR JOB]
+Decompose what's MISSING from the existing Story set.
 \`\`\`json
 {
   "shape":"epic_decomposition",
@@ -298,22 +295,32 @@ export const PROMPT_BUILDERS = {
 // ── Output parser ─────────────────────────────────────────────────────────
 
 const FENCED_JSON_RE = /```json\s*\n([\s\S]+?)\n```/;
+const FENCED_ANY_RE = /```\w*\s*\n(\{[\s\S]+?\})\n```/;
+const RAW_JSON_RE = /(\{[\s\S]*\})/;
 const FENCED_DIFF_RE = /```diff\s*\n([\s\S]+?)\n```/;
 
 export function parseOutput(roleHint, finalText) {
   if (!finalText || finalText.length < 10) {
     return { ok: false, error: "empty_or_short_response" };
   }
-  const jsonMatch = finalText.match(FENCED_JSON_RE);
-  if (!jsonMatch) {
+  // Three-pass JSON extraction: ```json fenced -> any fenced w/ braces -> raw braces.
+  // Per Task prompt-eng-pm-output-shape-2026-05-11: PM (qwen2.5-coder:14b) sometimes
+  // forgets the json fence; falling back lets the run complete instead of stranding.
+  let jsonText = null;
+  let extracted_via = null;
+  let m;
+  if ((m = finalText.match(FENCED_JSON_RE))) { jsonText = m[1]; extracted_via = "fenced_json"; }
+  else if ((m = finalText.match(FENCED_ANY_RE))) { jsonText = m[1]; extracted_via = "fenced_any"; }
+  else if ((m = finalText.match(RAW_JSON_RE))) { jsonText = m[1]; extracted_via = "raw_braces"; }
+  if (!jsonText) {
     return { ok: false, error: "no_fenced_json_block", preview: finalText.slice(0, 300) };
   }
   let parsed;
-  try { parsed = JSON.parse(jsonMatch[1]); }
+  try { parsed = JSON.parse(jsonText); }
   catch (e) {
-    return { ok: false, error: `json_parse_failed: ${e.message}`, raw: jsonMatch[1].slice(0, 400) };
+    return { ok: false, error: `json_parse_failed: ${e.message}`, extracted_via, raw: jsonText.slice(0, 400) };
   }
   const diffMatch = finalText.match(FENCED_DIFF_RE);
   const diff = diffMatch ? diffMatch[1] : null;
-  return { ok: true, shape: parsed.shape, parsed, diff };
+  return { ok: true, shape: parsed.shape, parsed, diff, extracted_via };
 }

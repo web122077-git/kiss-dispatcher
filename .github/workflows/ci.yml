@@ -41,6 +41,9 @@ jobs:
       - name: Unit test — test-runner
         run: node tests/test-runner.test.mjs
 
+      - name: Unit test — parser fallback (prompt-eng-pm-output-shape)
+        run: node tests/parser-fallback.test.mjs
+
       - name: Wire-up sanity (no top-level throws on import)
         run: |
           # The dispatcher's index.mjs auto-runs main() — we can't import it
