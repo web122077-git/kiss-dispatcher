@@ -96,6 +96,11 @@ async function patchTask(taskId, body) {
 
 // T3: server-side CAS handled the claim. Local bookkeeping records the run.
 async function recordRunStart(task) {
+  // The Task row's role_hint may be null (legacy Tasks filed before the enum widened,
+  // or Tasks routed by assignee_id alone). dispatcher_runs.role_hint is NOT NULL, so
+  // fall back to this worker's ROLE_HINT — that's always set on boot. Closes Task
+  // kiss-dispatcher-record-run-start-role-hint-null-2026-05-12.
+  const roleHint = task.role_hint || ROLE_HINT;
   const client = await pool.connect();
   try {
     await client.query(
@@ -104,7 +109,7 @@ async function recordRunStart(task) {
        ON CONFLICT (task_id) DO UPDATE
          SET worker_id=$3, claimed_at=now(), status='doing', result=NULL, finished_at=NULL,
              redispatch_count=dispatcher_runs.redispatch_count+1`,
-      [task.id, task.role_hint, WORKER_ID]);
+      [task.id, roleHint, WORKER_ID]);
   } catch (e) {
     log("warn", "recordRunStart_failed", { taskId: task.id, err: e.message });
   } finally { client.release(); }
