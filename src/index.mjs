@@ -10,7 +10,7 @@ import { toolsForRole } from "./tools.mjs";
 import { PROMPT_BUILDERS, parseOutput } from "./prompts.mjs";
 import { runTest } from "./test-runner.mjs";
 
-const PG_URL     = process.env.PG_URL     || "postgresql://postgres:kiss-spike-pw@10.98.98.34:5434/dispatcher";
+const PG_URL     = process.env.PG_URL     || "postgresql://kissadmin@127.0.0.1:5435/dispatcher"; // env-symmetric: prod = Aton loopback, zdev = zdev-aton loopback (mirrors Aton kiss-dispatcher-pg). Workers MUST set PG_URL via env file with the kissadmin password (bao secret/services/kiss-dispatcher-{zdev,prod} db-password).
 const CTX_API    = (process.env.CTX_API   || "http://10.77.77.2:3001").replace(/\/$/, "");
 const OLLAMA_URL = (process.env.OLLAMA_URL || "http://10.50.50.11:11434").replace(/\/$/, "");
 const MODEL      = process.env.MODEL      || "qwen3-coder:30b";
