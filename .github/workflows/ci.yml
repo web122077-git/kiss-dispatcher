@@ -89,17 +89,17 @@ jobs:
           retry rsync -avz --delete \
             --exclude='.git' --exclude='node_modules' --exclude='tests' \
             --exclude='package-lock.json' \
-            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no" \
+            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
             ./ svc-ansible@10.77.77.2:/opt/kiss-dispatcher/
 
-          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.77.77.2 \
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes svc-ansible@10.77.77.2 \
             "cd /opt/kiss-dispatcher && npm install --production 2>&1 | tail -5"
 
           # Restart every kiss-dispatcher@<role>.service instance. The glob
           # is safe: it expands to the currently-loaded instances (doc, etc.).
           # Use || true so an empty match (no roles installed) is a no-op,
           # not a failure.
-          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.77.77.2 \
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes svc-ansible@10.77.77.2 \
             "sudo systemctl restart 'kiss-dispatcher@*.service' 2>&1 || true; sudo systemctl list-units 'kiss-dispatcher@*' --no-pager"
 
           echo "kiss-dispatcher@*.service restarted on Aton from /opt/kiss-dispatcher"
@@ -130,15 +130,15 @@ jobs:
           retry rsync -avz --delete \
             --exclude='.git' --exclude='node_modules' --exclude='tests' \
             --exclude='package-lock.json' \
-            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no" \
+            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
             ./ svc-ansible@10.98.98.10:/opt/kiss-dispatcher/
 
-          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.98.98.10 \
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes svc-ansible@10.98.98.10 \
             "cd /opt/kiss-dispatcher && npm install --production 2>&1 | tail -5"
 
           # zdev-aton may not have kiss-dispatcher@*.service units installed yet.
           # Restart anything that IS active; do not fail if no units exist.
-          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.98.98.10 \
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes svc-ansible@10.98.98.10 \
             "sudo systemctl restart 'kiss-dispatcher@*.service' 2>&1 || true; sudo systemctl list-units 'kiss-dispatcher@*' --no-pager 2>&1 || echo 'no kiss-dispatcher@*.service on zdev-aton yet'"
 
           echo "kiss-dispatcher synced to zdev-aton:/opt/kiss-dispatcher (restart best-effort)"
