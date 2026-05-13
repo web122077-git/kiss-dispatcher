@@ -705,10 +705,19 @@ async function executeOne(task) {
     }
 
     const gossSuffix = (gossDeferral && gossDeferral.ok) ? ` goss_verify=${gossDeferral.newId}` : "";
-    const setDone = await patchTask(task.id, {
+    // Story:cabinet-show-openclaw-task-status — if DO delegated to OpenClaw, the
+    // parsed JSON block carries openclaw_task_id. Persist it on the Task node so
+    // the cabinet can render it inline (closes the doer-surface visibility loop —
+    // without this, the cabinet sees "doing" while DO is waiting on a remote run).
+    const openclawTaskId = parsed.ok && typeof parsed.parsed?.openclaw_task_id === "string" && parsed.parsed.openclaw_task_id.length > 0
+      ? parsed.parsed.openclaw_task_id : null;
+    const ocSuffix = openclawTaskId ? ` openclaw_task_id=${openclawTaskId}` : "";
+    const donePatch = {
       status: "done",
-      resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=${ROLE_HINT} tool_calls=${chat.toolCallsMade.length}${gossSuffix}] ${summary.slice(0, 480)}`,
-    });
+      resolution: `[kiss-dispatcher ${WORKER_ID} model=${MODEL} role=${ROLE_HINT} tool_calls=${chat.toolCallsMade.length}${gossSuffix}${ocSuffix}] ${summary.slice(0, 480)}`,
+    };
+    if (openclawTaskId) donePatch.openclaw_task_id = openclawTaskId;
+    const setDone = await patchTask(task.id, donePatch);
     if (!setDone.ok) throw new Error(`patch done failed: ${setDone.status} ${setDone.body.slice(0,160)}`);
 
     await finishRun(task.id, "done", summary, testRunOutcome ? { test_output: testRunOutcome } : {});
