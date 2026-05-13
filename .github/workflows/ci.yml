@@ -3,15 +3,16 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 # Per ADR adr-ci-self-hosted-runner-conventions-2026-05-04: use the
-# homelab github-lxc runner (label: 10310github). Cancellable per ref.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+# homelab github-lxc runner (label: 10310github).
+# No top-level concurrency: the deploy jobs declare their own (with
+# cancel-in-progress: false) so two back-to-back pushes do not interleave
+# the systemctl restart of kiss-dispatcher@*.service. Lint runs may
+# overlap; that is fine since they are idempotent.
 
 jobs:
   smoke:
@@ -59,3 +60,85 @@ jobs:
           grep -q "runTest" src/index.mjs
           grep -q "diffTouchesGoss" src/index.mjs
           echo "load-bearing exports present"
+
+  deploy-to-prod:
+    runs-on: [self-hosted, 10310github]
+    needs: smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+    # Serialize prod deploys: two back-to-back pushes must not interleave
+    # the systemctl restart of kiss-dispatcher@*.service on Aton.
+    concurrency:
+      group: deploy-prod-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Deploy kiss-dispatcher to Aton:/opt/kiss-dispatcher
+        run: |
+          retry() {
+            for i in 1 2 3; do
+              if "$@"; then return 0; fi
+              echo "Attempt ${i} failed, retrying in 5s..."
+              sleep 5
+            done
+            echo "ERROR: command failed after 3 attempts: $*"
+            return 1
+          }
+
+          retry rsync -avz --delete \
+            --exclude='.git' --exclude='node_modules' --exclude='tests' \
+            --exclude='package-lock.json' \
+            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no" \
+            ./ svc-ansible@10.77.77.2:/opt/kiss-dispatcher/
+
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.77.77.2 \
+            "cd /opt/kiss-dispatcher && npm install --production 2>&1 | tail -5"
+
+          # Restart every kiss-dispatcher@<role>.service instance. The glob
+          # is safe: it expands to the currently-loaded instances (doc, etc.).
+          # Use || true so an empty match (no roles installed) is a no-op,
+          # not a failure.
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.77.77.2 \
+            "sudo systemctl restart 'kiss-dispatcher@*.service' 2>&1 || true; sudo systemctl list-units 'kiss-dispatcher@*' --no-pager"
+
+          echo "kiss-dispatcher@*.service restarted on Aton from /opt/kiss-dispatcher"
+
+  deploy-to-zdev:
+    runs-on: [self-hosted, zdev-github]
+    needs: smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-zdev-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Deploy kiss-dispatcher to zdev-aton:/opt/kiss-dispatcher
+        run: |
+          retry() {
+            for i in 1 2 3; do
+              if "$@"; then return 0; fi
+              echo "Attempt ${i} failed, retrying in 5s..."
+              sleep 5
+            done
+            echo "ERROR: command failed after 3 attempts: $*"
+            return 1
+          }
+
+          retry rsync -avz --delete \
+            --exclude='.git' --exclude='node_modules' --exclude='tests' \
+            --exclude='package-lock.json' \
+            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no" \
+            ./ svc-ansible@10.98.98.10:/opt/kiss-dispatcher/
+
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.98.98.10 \
+            "cd /opt/kiss-dispatcher && npm install --production 2>&1 | tail -5"
+
+          # zdev-aton may not have kiss-dispatcher@*.service units installed yet.
+          # Restart anything that IS active; do not fail if no units exist.
+          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no svc-ansible@10.98.98.10 \
+            "sudo systemctl restart 'kiss-dispatcher@*.service' 2>&1 || true; sudo systemctl list-units 'kiss-dispatcher@*' --no-pager 2>&1 || echo 'no kiss-dispatcher@*.service on zdev-aton yet'"
+
+          echo "kiss-dispatcher synced to zdev-aton:/opt/kiss-dispatcher (restart best-effort)"
