@@ -545,6 +545,18 @@ export const TOOL_EXECUTORS = {
   file_write: async ({ path: p, content, mode = "overwrite" }) => {
     const { writeFile, appendFile } = await import("node:fs/promises");
     const abs = path.resolve(p);
+    // ── Path gate — block writes to system directories ──────────────────────
+    // Mirrors BLOCK_PATTERNS in bash-gate.py. Fail-open: errors allow.
+    // Story: destructive-command-gate-spike-2026-05-13
+    const BLOCKED_PREFIXES = [
+      "/etc/", "/boot/", "/sys/", "/proc/", "/dev/",
+      "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
+    ];
+    for (const prefix of BLOCKED_PREFIXES) {
+      if (abs.startsWith(prefix)) {
+        return { ok: false, error: `file_write to ${prefix}* is blocked — system path` };
+      }
+    }
     if (!abs.startsWith(FILE_READ_ROOT)) return { ok: false, error: `path outside ${FILE_READ_ROOT}` };
     if (mode === "append") { await appendFile(abs, content, "utf8"); }
     else { await writeFile(abs, content, "utf8"); }
