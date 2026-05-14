@@ -95,7 +95,28 @@ async function patchTask(taskId, body) {
 }
 
 // T3: server-side CAS handled the claim. Local bookkeeping records the run.
+
+// ── Dispatch event emitter — fire-and-forget, never throws ─────────────────
+// Story: cabinet-show-dispatcher-runtime-events-2026-05
+// Writes a DispatchEvent node to Neo4j via context-api so the Cabinet can
+// surface a live runtime event stream without PG access.
+function emitDispatchEvent(action, taskId, extra = {}) {
+  const body = {
+    action,
+    task_id: taskId,
+    worker_id: WORKER_ID,
+    role_hint: ROLE_HINT,
+    details: extra,
+  };
+  fetch(`${CTX_API}/agile/dispatch-event`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch(() => { /* fire-and-forget: Neo4j write failure must not abort the worker */ });
+}
+
 async function recordRunStart(task) {
+  emitDispatchEvent("run_start", task.id, { role_hint: task.role_hint || ROLE_HINT, title: (task.title || "").slice(0, 80) });
   // The Task row's role_hint may be null (legacy Tasks filed before the enum widened,
   // or Tasks routed by assignee_id alone). dispatcher_runs.role_hint is NOT NULL, so
   // fall back to this worker's ROLE_HINT — that's always set on boot. Closes Task
@@ -124,6 +145,7 @@ async function ensureTestOutputCol() {
 }
 
 async function finishRun(taskId, status, result, extra = {}) {
+  emitDispatchEvent(status === "done" ? "run_done" : "run_failed", taskId, { status, result: (result || "").slice(0, 160) });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
