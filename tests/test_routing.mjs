@@ -1,7 +1,7 @@
 // Quick unit test for complexityEstimate — run with: node test_routing.mjs
 // Mirrors the assertions the CI gate (T5 extension) will enforce.
 
-import { complexityEstimate } from "/tmp/routing.mjs";
+import { complexityEstimate } from "../src/routing.mjs";
 
 let pass = 0, fail = 0;
 function assert(label, got, expected) {
