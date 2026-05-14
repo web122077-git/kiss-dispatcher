@@ -704,6 +704,17 @@ async function executeOne(task) {
       return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, qa_verdict: qv };
     }
 
+    // CLOSER skills-from-experience: file skill-promotion Stories if present
+    if (ROLE_HINT === "closer" && parsed.ok && Array.isArray(parsed.parsed?.skill_promotion_stories) && parsed.parsed.skill_promotion_stories.length > 0) {
+      try {
+        const spr = await handleSkillPromotionStories(task, parsed.parsed.skill_promotion_stories);
+        log("info", "skill_promo_complete", { taskId: task.id, filed: spr.filed, total: parsed.parsed.skill_promotion_stories.length });
+      } catch (e) {
+        log("error", "skill_promo_threw", { taskId: task.id, err: e.message });
+        // non-fatal: CLOSER run still completes
+      }
+    }
+
     const gossSuffix = (gossDeferral && gossDeferral.ok) ? ` goss_verify=${gossDeferral.newId}` : "";
     // Story:cabinet-show-openclaw-task-status — if DO delegated to OpenClaw, the
     // parsed JSON block carries openclaw_task_id. Persist it on the Task node so
@@ -738,6 +749,61 @@ async function executeOne(task) {
     }
     return { ok: false, error: String(e.message || e), taskId: task.id };
   }
+}
+
+
+// ── CLOSER skills-from-experience: auto-file skill-promotion Stories ────────
+// Story: persona-prompts-with-skills-from-experience-2026-05
+// When CLOSER includes skill_promotion_stories in its output, POST each entry
+// as a Story under the active skills-hygiene Epic so future sessions can
+// promote recurring lessons into marketplace skills.
+
+const SKILL_PROMO_EPIC = process.env.SKILL_PROMO_EPIC || "local-llm-team-stitch-2026-05";
+
+async function handleSkillPromotionStories(task, promotions) {
+  if (!Array.isArray(promotions) || promotions.length === 0) return { ok: true, filed: 0 };
+  const capped = promotions.slice(0, 3); // cap per CLOSER prompt instructions
+  const results = [];
+  for (const promo of capped) {
+    const title = (promo.title || "").trim();
+    const description = (promo.description || "").trim();
+    const lessonPattern = (promo.lesson_pattern || "").trim();
+    if (!title || !description) {
+      results.push({ ok: false, error: "missing title or description", promo });
+      continue;
+    }
+    const storyId = `skill-promo-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const body = {
+      id: storyId,
+      title: `[skill-promo] ${title}`,
+      description: `**Lesson pattern:** ${lessonPattern}
+
+${description}
+
+*Auto-filed by CLOSER skills-from-experience loop from Task ${task.id}.*`,
+      acceptance_criteria: "A new or improved SKILL.md is written and merged into the homelab-marketplace plugin. The recurring lesson pattern is codified so future sessions can load it automatically.",
+      parent_id: SKILL_PROMO_EPIC,
+      tags: ["skill-promotion", "from-closer"],
+    };
+    try {
+      const r = await fetch(`${CTX_API}/agile/story`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const rb = await r.text();
+        results.push({ ok: false, error: `POST ${r.status}: ${rb.slice(0, 160)}`, storyId });
+      } else {
+        results.push({ ok: true, storyId });
+        log("info", "skill_promo_story_filed", { storyId, lessonPattern, closerTaskId: task.id });
+      }
+    } catch (e) {
+      results.push({ ok: false, error: e.message, storyId });
+    }
+  }
+  const filed = results.filter(r => r.ok).length;
+  return { ok: true, filed, results };
 }
 
 async function tick() {
