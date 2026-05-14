@@ -623,10 +623,27 @@ async function executeOne(task) {
     const _backends    = await loadBackends();
     const _systemState = await getSystemState(_backends);
     const _routing     = await selectBackend(task, persona, _backends, _systemState);
-    log("info", "routing_decision", { taskId: task.id, backend: _routing._routing_meta?.backend_id,
-      model: _routing.model, tier: _routing._routing_meta?.model_tier,
-      escalated: _routing._routing_meta?.escalated, hot: _routing._routing_meta?.hot,
-      fallback: _routing._routing_meta?.fallback_reason });
+    const _rmeta = _routing._routing_meta || {};
+    log("info", "routing_decision", { taskId: task.id, backend: _rmeta.backend_id,
+      model: _routing.model, tier: _rmeta.model_tier,
+      escalated: _rmeta.escalated, hot: _rmeta.hot, fallback: _rmeta.fallback_reason });
+    // Persist routing decision to context-api audit log for the routing observer UI (T7).
+    // Fire-and-forget — failure must not block task execution.
+    fetch(`${CTX_API}/log`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "routing_decision",
+        target: task.id,
+        session: WORKER_ID,
+        details: JSON.stringify({
+          backend: _rmeta.backend_id, model: _routing.model,
+          tier: _rmeta.model_tier, escalated: _rmeta.escalated,
+          hot: _rmeta.hot, fallback: _rmeta.fallback_reason,
+          complexity: _rmeta.complexity, persona: persona?.id,
+        }),
+      }),
+    }).catch(e => log("warn", "routing_decision_log_failed", { err: e.message }));
 
     const chat = await chatWithTools({
       ollamaUrl: _routing.backendUrl,
