@@ -9,6 +9,8 @@ import { chatWithTools } from "./ollama.mjs";
 import { toolsForRole } from "./tools.mjs";
 import { PROMPT_BUILDERS, parseOutput } from "./prompts.mjs";
 import { runTest } from "./test-runner.mjs";
+import { complexityBump } from "./routing.mjs";
+
 
 const PG_URL     = process.env.PG_URL     || "postgresql://kissadmin@127.0.0.1:5435/dispatcher"; // env-symmetric: prod = Aton loopback, zdev = zdev-aton loopback (mirrors Aton kiss-dispatcher-pg). Workers MUST set PG_URL via env file with the kissadmin password (bao secret/services/kiss-dispatcher-{zdev,prod} db-password).
 const CTX_API    = (process.env.CTX_API   || "http://10.77.77.2:3001").replace(/\/$/, "");
@@ -599,6 +601,10 @@ function buildUserPrompt(task, persona, hints = {}) {
 async function executeOne(task) {
   // task is already claimed (status=doing) by the server before we got here.
   await recordRunStart(task);
+  // T4: bump complexity score based on failure history before routing.
+  await complexityBump(task, { pool, ctxApi: CTX_API, log }).catch(e =>
+    log("warn", "complexityBump_skipped", { taskId: task.id, err: e.message })
+  );
 
   try {
     const personas = await loadPersonas();

@@ -51,6 +51,9 @@ jobs:
       - name: Unit test — complexityEstimate routing heuristic (T3 dispatcher-routing-abstraction-2026-05)
         run: node tests/test_routing.mjs
 
+      - name: Unit test — complexityBump failure-signal bump (T4 dispatcher-routing-abstraction-2026-05)
+        run: node tests/test_complexity_bump.mjs
+
       - name: Wire-up sanity (no top-level throws on import)
         run: |
           # The dispatcher's index.mjs auto-runs main() — we can't import it
