@@ -628,6 +628,7 @@ async function executeOne(task) {
       apiShape: persona.api_shape || process.env.API_SHAPE,
       authBearer: process.env.GATEWAY_BEARER,
       log,
+      taskId: task.id,
     });
 
     const summary = (chat.finalText || "").trim();

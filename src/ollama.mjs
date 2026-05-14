@@ -29,7 +29,7 @@ const PER_CALL_TIMEOUT_MS = 180_000; // 3 min per /api/chat round-trip
  * @param {(level,msg,extra)=>void} [args.log]
  * @returns {Promise<{messages, finalText, iterations, toolCallsMade}>}
  */
-export async function chatWithTools({ ollamaUrl, model, messages, tools, options = {}, log, apiShape, authBearer }) {
+export async function chatWithTools({ ollamaUrl, model, messages, tools, options = {}, log, apiShape, authBearer, taskId = null }) {
   const conv = messages.slice();
   const toolCallsMade = [];
   let iteration = 0;
@@ -94,7 +94,7 @@ export async function chatWithTools({ ollamaUrl, model, messages, tools, options
       }
       args = args || {};
       log?.("info", "tool_call", { iteration, name, args });
-      const result = await executeTool(name, args, process.env.ROLE_HINT);
+      const result = await executeTool(name, args, process.env.ROLE_HINT, taskId);
       toolCallsMade.push({ iteration, name, args, result_len: typeof result === "string" ? result.length : 0 });
       conv.push({
         role: "tool",

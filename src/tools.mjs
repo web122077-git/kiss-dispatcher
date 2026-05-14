@@ -182,6 +182,63 @@ export const TOOL_SCHEMAS = {
       }
     }
   },
+
+  // ── Write-tier tools — require explicit approval before execution ─────────
+  // x-requires-explicit-approval: true causes executeTool to file an
+  // ApprovalRequest node and return { ok:false, approval_pending:true }
+  // instead of executing the tool. The Cabinet polls /approvals/pending and
+  // surfaces Allow-once / Allow-always / Deny buttons.
+  // Story: permission-request-ui-track2-allowlists-2026-05
+  agile_node_create: {
+    type: "function",
+    "x-requires-explicit-approval": true,
+    function: {
+      name: "agile_node_create",
+      description: "Create an agile node (epic/story/task/decision/ticket/blocker) on the board. Use after read tools confirm the item does not already exist. Requires explicit approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          label: { type: "string", enum: ["epic","story","task","decision","ticket","blocker"], description: "Node type" },
+          body:  { type: "object", description: "Full payload for POST /agile/<label> — must include id and title at minimum" }
+        },
+        required: ["label","body"]
+      }
+    }
+  },
+  agile_node_patch: {
+    type: "function",
+    "x-requires-explicit-approval": true,
+    function: {
+      name: "agile_node_patch",
+      description: "Update or transition an agile node (status change, field update). Requires explicit approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          label: { type: "string", enum: ["epic","story","task","decision","ticket","blocker"] },
+          id:    { type: "string" },
+          patch: { type: "object", description: "Fields to PATCH. For status transitions include {status} and {resolution} if done/resolved." }
+        },
+        required: ["label","id","patch"]
+      }
+    }
+  },
+  file_write: {
+    type: "function",
+    "x-requires-explicit-approval": true,
+    function: {
+      name: "file_write",
+      description: "Write or overwrite a file under /10310L/repos/. Always call file_read first. Requires explicit approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          path:    { type: "string", description: "Absolute path under /10310L/repos/" },
+          content: { type: "string", description: "Full file content to write" },
+          mode:    { type: "string", enum: ["overwrite","append"], default: "overwrite" }
+        },
+        required: ["path","content"]
+      }
+    }
+  },
 };
 
 // Per-role tool allow-lists (mirrors personas.v7.json tool_catalog).
@@ -207,6 +264,15 @@ export function buildRoleTools(env) {
     // works without a tool-shape error. Effective allow-list is small on purpose.
     openclaw: ["xray","nodes_q","host","service","file_read","file_tree"],
   };
+  // Write-tier additions — all behind the approval gate in executeTool.
+  base.cpm    = [...base.cpm,    "agile_node_create","agile_node_patch"];
+  base.pm     = [...base.pm,     "agile_node_create","agile_node_patch"];
+  base.tl     = [...base.tl,     "agile_node_patch"];
+  base.be     = [...base.be,     "agile_node_patch","file_write"];
+  base.fe     = [...base.fe,     "agile_node_patch","file_write"];
+  base.do     = [...base.do,     "agile_node_patch","file_write"];
+  base.doc    = [...base.doc,    "file_write"];
+  base.closer = [...base.closer, "agile_node_create","agile_node_patch"];
   // Phase 4 Track 2: DO gets openclaw_* tools when OPENCLAW_MCP_URL is set.
   // Prod DO workers (env unset) keep the original allow-list unchanged.
   if (env && env.OPENCLAW_MCP_URL && String(env.OPENCLAW_MCP_URL).length > 0) {
@@ -458,6 +524,32 @@ export const TOOL_EXECUTORS = {
   openclaw_chat_async:       (a)              => openclawMcpCall("openclaw_chat_async", a),
   openclaw_task_status:      (a)              => openclawMcpCall("openclaw_task_status", a),
   openclaw_task_cancel:      (a)              => openclawMcpCall("openclaw_task_cancel", a),
+
+  // Write-tier executors — only reached after approval gate passes.
+  agile_node_create: async ({ label, body }) => {
+    const r = await fetch(`${CTX_API}/agile/${encodeURIComponent(label)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return r.json().catch(() => ({ ok: r.ok, status: r.status }));
+  },
+  agile_node_patch: async ({ label, id, patch }) => {
+    const r = await fetch(`${CTX_API}/agile/${encodeURIComponent(label)}/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    return r.json().catch(() => ({ ok: r.ok, status: r.status }));
+  },
+  file_write: async ({ path: p, content, mode = "overwrite" }) => {
+    const { writeFile, appendFile } = await import("node:fs/promises");
+    const abs = path.resolve(p);
+    if (!abs.startsWith(FILE_READ_ROOT)) return { ok: false, error: `path outside ${FILE_READ_ROOT}` };
+    if (mode === "append") { await appendFile(abs, content, "utf8"); }
+    else { await writeFile(abs, content, "utf8"); }
+    return { ok: true, path: abs, bytes: content.length };
+  },
 };
 
 // Result size cap to protect downstream prompts.
@@ -467,9 +559,62 @@ const TOOL_RESULT_CHAR_CAP = 6000;
 // Back-compat: if roleHint is omitted (or unknown), the role gate is skipped
 // and the executor is dispatched on TOOL_EXECUTORS lookup alone — same as
 // pre-T4 behavior. The dispatcher passes ROLE_HINT from env in production.
-export async function executeTool(name, args, roleHint) {
+// Derived once at module load — O(1) membership check per tool call.
+const APPROVAL_REQUIRED_TOOLS = new Set(
+  Object.entries(TOOL_SCHEMAS)
+    .filter(([, s]) => s?.["x-requires-explicit-approval"] === true)
+    .map(([name]) => name)
+);
+
+// executeTool(name, args, roleHint, taskId)
+// taskId is the currently-executing Task id (for ApprovalRequest provenance).
+// Back-compat: taskId defaults to null; approval requests still work without it.
+export async function executeTool(name, args, roleHint, taskId = null) {
   if (roleHint && ROLE_TOOLS[roleHint] && !ROLE_TOOLS[roleHint].includes(name)) {
     return JSON.stringify({ ok: false, error: `tool ${name} not in allow-list for role ${roleHint}` });
+  }
+  // ── Approval gate — write-tier tools short-circuit until a grant exists ───
+  // Story: permission-request-ui-track2-allowlists-2026-05
+  if (APPROVAL_REQUIRED_TOOLS.has(name)) {
+    let check = null;
+    try {
+      const cr = await fetch(
+        `${CTX_API}/approvals/check?tool=${encodeURIComponent(name)}&role=${encodeURIComponent(roleHint || "")}`
+      );
+      if (cr.ok) check = await cr.json();
+    } catch (_) { /* context-api unreachable — treat as no grant */ }
+
+    if (!check?.granted) {
+      // File a pending request so the Cabinet can surface it.
+      let reqId = `apr-err-${Date.now()}`;
+      try {
+        const rr = await fetch(`${CTX_API}/approvals/request`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tool_name: name,
+            args_json: JSON.stringify(args || {}),
+            role: roleHint || "",
+            requester_task_id: taskId || "",
+          }),
+        });
+        if (rr.ok) { const rb = await rr.json(); reqId = rb.id || reqId; }
+      } catch (_) { /* fire-and-forget: approval filing failure must not crash the worker */ }
+      return JSON.stringify({
+        ok: false,
+        approval_pending: true,
+        approval_id: reqId,
+        message: `Tool '${name}' requires explicit approval. Request filed as ${reqId}. Open Cabinet (/cabinet) to Allow or Deny.`,
+      });
+    }
+    // Grant exists: if allow_once, consume it best-effort (non-fatal).
+    if (check.status === "allowed_once" && check.approval_id) {
+      fetch(`${CTX_API}/approvals/${encodeURIComponent(check.approval_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "consumed" }),
+      }).catch(() => {});
+    }
   }
   const fn = TOOL_EXECUTORS[name];
   if (!fn) return JSON.stringify({ ok: false, error: `unknown tool: ${name}` });
