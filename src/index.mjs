@@ -724,6 +724,18 @@ async function executeOne(task) {
     return { ok: true, taskId: task.id, iterations: chat.iterations, tool_calls: chat.toolCallsMade.length, test_runner: testRunOutcome ? { run_status: testRunOutcome.run_status, exit_code: testRunOutcome.exit_code } : null, goss_deferral: gossDeferral };
   } catch (e) {
     await finishRun(task.id, "failed", String(e.message || e));
+    // BUG FIX (kiss-dispatcher-bug-stuck-doing-on-handler-error-2026-05-11):
+    // Always PATCH Task out of 'doing' on any unhandled throw so it doesn't
+    // get permanently stuck. Wrapped in its own try/catch so a secondary
+    // network failure doesn't shadow the original error.
+    try {
+      await patchTask(task.id, {
+        status: "done",
+        resolution: `[kiss-dispatcher ${WORKER_ID} UNHANDLED_ERROR role=${ROLE_HINT}] ${String(e.message || e).slice(0, 400)}`,
+      });
+    } catch (pe) {
+      log("error", "patch_after_error_failed", { taskId: task.id, err: pe.message });
+    }
     return { ok: false, error: String(e.message || e), taskId: task.id };
   }
 }
