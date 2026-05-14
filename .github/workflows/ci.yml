@@ -48,6 +48,9 @@ jobs:
       - name: Unit test — openclaw-tools allow-list gating (T4 openclaw-spike-zdev-2026-05)
         run: node tests/openclaw-tools.test.mjs
 
+      - name: Unit test — complexityEstimate routing heuristic (T3 dispatcher-routing-abstraction-2026-05)
+        run: node tests/test_routing.mjs
+
       - name: Wire-up sanity (no top-level throws on import)
         run: |
           # The dispatcher's index.mjs auto-runs main() — we can't import it
