@@ -1,0 +1,38 @@
+{
+  "version": "1",
+  "updated_at": "2026-05-14T00:00:00Z",
+  "_comment": "Shared destructive-command gate patterns. Deploy via playbook 44_deploy_gate_patterns.yml. Edit here; both bash-gate.py and kiss-dispatcher/tools.mjs load this file at runtime with hardcoded fallback.",
+  "bash_block_patterns": [
+    {"pattern": "\\bpct\\s+destroy\\b",                               "reason": "pct destroy permanently deletes an LXC container"},
+    {"pattern": "\\bqm\\s+destroy\\b",                                "reason": "qm destroy permanently deletes a VM"},
+    {"pattern": "\\blvremove\\b",                                     "reason": "lvremove destroys an LVM logical volume"},
+    {"pattern": "\\bvgremove\\b",                                     "reason": "vgremove destroys an LVM volume group"},
+    {"pattern": "\\bpvremove\\b",                                     "reason": "pvremove destroys an LVM physical volume"},
+    {"pattern": "\\bwipefs\\b",                                       "reason": "wipefs erases filesystem signatures on a block device"},
+    {"pattern": "\\bmkfs\\b",                                         "reason": "mkfs formats a filesystem, erasing all data"},
+    {"pattern": "\\bdd\\s+.*\\bof=/dev/",                             "reason": "dd to /dev/* overwrites raw disk data"},
+    {"pattern": "\\bshred\\s+.*/dev/",                                "reason": "shred on /dev/* destroys raw disk data"},
+    {"pattern": "\\bzpool\\s+destroy\\b",                             "reason": "zpool destroy removes a ZFS pool and all its data"},
+    {"pattern": "\\bzfs\\s+destroy\\s+-[rR]",                         "reason": "zfs destroy -r/-R recursively destroys datasets"},
+    {"pattern": "rm\\s+(?:-[^\\s]+\\s+)*-[^\\s]*r[^\\s]*\\s+/$",    "reason": "rm -rf / would destroy the root filesystem"},
+    {"pattern": "rm\\s+(?:-[^\\s]+\\s+)*-[^\\s]*r[^\\s]*\\s+/etc\\b","reason": "rm -rf /etc destroys system configuration"},
+    {"pattern": "rm\\s+(?:-[^\\s]+\\s+)*-[^\\s]*r[^\\s]*\\s+/home\\b","reason": "rm -rf /home destroys all user data"},
+    {"pattern": "rm\\s+(?:-[^\\s]+\\s+)*-[^\\s]*r[^\\s]*\\s+/opt\\b", "reason": "rm -rf /opt destroys all services"},
+    {"pattern": "rm\\s+(?:-[^\\s]+\\s+)*-[^\\s]*r[^\\s]*\\s+/var\\b", "reason": "rm -rf /var destroys logs and databases"},
+    {"pattern": "rm\\s+(?:-[^\\s]+\\s+)*-[^\\s]*r[^\\s]*\\s+\\$HOME\\b","reason": "rm -rf $HOME destroys the user home directory"},
+    {"pattern": "\\bDROP\\s+DATABASE\\b",                             "reason": "DROP DATABASE permanently destroys a database"},
+    {"pattern": "\\bDROP\\s+SCHEMA\\b",                               "reason": "DROP SCHEMA permanently destroys a schema and its data"},
+    {"pattern": "\\bpvesm\\s+remove\\b",                              "reason": "pvesm remove destroys a Proxmox storage definition"}
+  ],
+  "file_write_blocked_prefixes": [
+    "/etc/",
+    "/boot/",
+    "/sys/",
+    "/proc/",
+    "/dev/",
+    "/bin/",
+    "/sbin/",
+    "/usr/bin/",
+    "/usr/sbin/"
+  ]
+}

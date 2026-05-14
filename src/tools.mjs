@@ -1,3 +1,7 @@
+import { readFile, readdir, stat } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 // Read-only context-api + file tools available to all personas in Phase 2 T2a.
 // Per decision-tools-per-role-not-batch-2026-05-11: read tools inline; write/external
 // tools (svc-ansible-ssh, openbao, openclaw, file-write) stay in Phase 4 Track 2.
@@ -10,8 +14,25 @@
 const CTX_API = (process.env.CTX_API || "http://10.77.77.2:3001").replace(/\/$/, "");
 const FILE_READ_ROOT = process.env.FILE_READ_ROOT || "/10310L/repos";
 
-import { readFile, readdir, stat } from "node:fs/promises";
-import path from "node:path";
+// ── Gate patterns: load file_write_blocked_prefixes from shared JSON ──────
+// Path: $GATE_PATTERNS_PATH or kiss-dispatcher/gate-patterns.json (one level up from src/).
+// Fail-open: falls back to hardcoded list if file is missing or unparseable.
+const _HARDCODED_BLOCKED_PREFIXES = [
+  "/etc/", "/boot/", "/sys/", "/proc/", "/dev/",
+  "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
+];
+function _loadFileWriteBlockedPrefixes() {
+  const p = process.env.GATE_PATTERNS_PATH ||
+    new URL("../gate-patterns.json", import.meta.url).pathname;
+  try {
+    const data = JSON.parse(readFileSync(p, "utf8"));
+    const list = data.file_write_blocked_prefixes;
+    if (Array.isArray(list) && list.length) return list;
+  } catch (_) { /* fall through */ }
+  return _HARDCODED_BLOCKED_PREFIXES;
+}
+const FILE_WRITE_BLOCKED_PREFIXES = _loadFileWriteBlockedPrefixes();
+
 
 // Tool descriptors in OpenAI function-calling format (Ollama-compatible).
 export const TOOL_SCHEMAS = {
@@ -548,11 +569,7 @@ export const TOOL_EXECUTORS = {
     // ── Path gate — block writes to system directories ──────────────────────
     // Mirrors BLOCK_PATTERNS in bash-gate.py. Fail-open: errors allow.
     // Story: destructive-command-gate-spike-2026-05-13
-    const BLOCKED_PREFIXES = [
-      "/etc/", "/boot/", "/sys/", "/proc/", "/dev/",
-      "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
-    ];
-    for (const prefix of BLOCKED_PREFIXES) {
+    for (const prefix of FILE_WRITE_BLOCKED_PREFIXES) {
       if (abs.startsWith(prefix)) {
         return { ok: false, error: `file_write to ${prefix}* is blocked — system path` };
       }
