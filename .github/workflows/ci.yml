@@ -54,6 +54,9 @@ jobs:
       - name: Unit test — complexityBump failure-signal bump (T4 dispatcher-routing-abstraction-2026-05)
         run: node tests/test_complexity_bump.mjs
 
+      - name: Unit test — selectBackend routing decision (T5 dispatcher-routing-abstraction-2026-05)
+        run: node tests/test_select_backend.mjs
+
       - name: Wire-up sanity (no top-level throws on import)
         run: |
           # The dispatcher's index.mjs auto-runs main() — we can't import it

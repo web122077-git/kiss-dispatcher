@@ -9,7 +9,7 @@ import { chatWithTools } from "./ollama.mjs";
 import { toolsForRole } from "./tools.mjs";
 import { PROMPT_BUILDERS, parseOutput } from "./prompts.mjs";
 import { runTest } from "./test-runner.mjs";
-import { complexityBump } from "./routing.mjs";
+import { complexityBump, selectBackend, loadBackends, getSystemState } from "./routing.mjs";
 
 
 const PG_URL     = process.env.PG_URL     || "postgresql://kissadmin@127.0.0.1:5435/dispatcher"; // env-symmetric: prod = Aton loopback, zdev = zdev-aton loopback (mirrors Aton kiss-dispatcher-pg). Workers MUST set PG_URL via env file with the kissadmin password (bao secret/services/kiss-dispatcher-{zdev,prod} db-password).
@@ -619,9 +619,18 @@ async function executeOne(task) {
 
     // status=doing was set atomically by server's claim — no PATCH needed here.
 
+    // T5: three-layer routing — pick backend + model dynamically.
+    const _backends    = await loadBackends();
+    const _systemState = await getSystemState(_backends);
+    const _routing     = await selectBackend(task, persona, _backends, _systemState);
+    log("info", "routing_decision", { taskId: task.id, backend: _routing._routing_meta?.backend_id,
+      model: _routing.model, tier: _routing._routing_meta?.model_tier,
+      escalated: _routing._routing_meta?.escalated, hot: _routing._routing_meta?.hot,
+      fallback: _routing._routing_meta?.fallback_reason });
+
     const chat = await chatWithTools({
-      ollamaUrl: OLLAMA_URL,
-      model: MODEL,
+      ollamaUrl: _routing.backendUrl,
+      model: _routing.model,
       messages,
       tools,
       options: {
@@ -631,7 +640,7 @@ async function executeOne(task) {
       },
       // openclaw and other OpenAI-compatible backends (Story:openclaw-as-peer-persona-2026-05-12).
       // The persona may declare api_shape: 'openai' / 'openai_compat'; env fallback supported.
-      apiShape: persona.api_shape || process.env.API_SHAPE,
+      apiShape: _routing.apiShape || persona.api_shape || process.env.API_SHAPE,
       authBearer: process.env.GATEWAY_BEARER,
       log,
       taskId: task.id,

@@ -207,22 +207,148 @@ export async function complexityBump(task, { pool, ctxApi, log }) {
   return newScore;
 }
 
-// ── selectBackend (T5 stub) ───────────────────────────────────────────────────
+// ── COST_TIER_RANK ─────────────────────────────────────────────────────────────
+const COST_TIER_RANK = { local: 0, "local-remote": 1, api: 2 };
+
+// ── getSystemState ─────────────────────────────────────────────────────────────
 /**
- * Pick best backend+model for a task given persona routing preferences.
- * STUB — returns legacy env-var values until T5 implements full logic.
+ * Probe each ollama-type backend for its currently-loaded models (/api/ps).
+ * Fail-open: a backend that doesn't respond gets an empty hot-model set.
+ * @param {Array} backends — full backends array from backends.json
+ * @returns {{ hotModels: Object<string, Set<string>> }}
+ *   hotModels is keyed by backend id; value is Set of model id strings currently loaded.
+ */
+export async function getSystemState(backends) {
+  const hotModels = {};
+  await Promise.all(
+    (backends || [])
+      .filter(b => b.type === "ollama")
+      .map(async b => {
+        try {
+          const res = await fetch(`${b.url}/api/ps`, {
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!res.ok) { hotModels[b.id] = new Set(); return; }
+          const { models = [] } = await res.json();
+          // Ollama /api/ps returns { models: [{ name, model, ... }] }
+          // "name" includes the tag (e.g. "qwen2.5-coder:14b")
+          hotModels[b.id] = new Set(models.map(m => m.name || m.model).filter(Boolean));
+        } catch {
+          hotModels[b.id] = new Set(); // fail-open
+        }
+      })
+  );
+  return { hotModels };
+}
+
+// ── selectBackend (T5 full impl) ───────────────────────────────────────────────
+/**
+ * Pick best backend + model for a task given persona routing preferences.
+ *
+ * Algorithm (three-layer routing, ADR adr-routing-abstraction-2026-05-14):
+ *  1. Compute complexity via complexityEstimate() (respects effective_complexity bump).
+ *  2. Determine if escalation is active (complexity >= escalation.complexity_threshold).
+ *  3. Resolve target tier + candidate backend list from persona routing block.
+ *  4. Filter out backends that exceed cost_ceiling or lack min_capabilities.
+ *  5. Walk preferred_backends in priority order; for each:
+ *     a. Find models of the target tier.
+ *     b. Prefer hot model (already loaded per /api/ps) for zero warm-up.
+ *     c. Among cold: prefer smallest for normal complexity, largest for escalated.
+ *  6. Fall back to legacy OLLAMA_URL/MODEL env vars (with reason logged).
+ *
+ * @param {object}   task        — full task node
+ * @param {object}   persona     — persona config (needs .routing block)
+ * @param {Array}    backends    — array from backends.json
+ * @param {object}   systemState — { hotModels } from getSystemState(); optional
+ * @returns {{ backendUrl, model, options, _routing_meta }}
  */
 export async function selectBackend(task, persona, backends, systemState = {}) {
-  const complexity = complexityEstimate(task);
+  const complexity    = complexityEstimate(task);
+  const routing       = persona?.routing || {};
+  const { hotModels = {} } = systemState;
+
+  // ── Escalation decision ────────────────────────────────────────────────────
+  const escalation  = routing.escalation || {};
+  const escalated   = escalation.complexity_threshold != null &&
+    complexity >= escalation.complexity_threshold;
+
+  const targetTier       = escalated
+    ? (escalation.escalated_tier   || routing.preferred_tier || "large")
+    : (routing.preferred_tier      || "medium");
+  const candidateIds     = escalated
+    ? (escalation.backends         || routing.preferred_backends || [])
+    : (routing.preferred_backends  || []);
+  const costCeiling      = routing.cost_ceiling || "api";
+  const costCeilingRank  = COST_TIER_RANK[costCeiling] ?? 2;
+  const minCaps          = new Set(routing.min_capabilities || []);
+
+  // ── Build lookup map ───────────────────────────────────────────────────────
+  const backendMap = Object.fromEntries((backends || []).map(b => [b.id, b]));
+
+  // ── Eligibility check ──────────────────────────────────────────────────────
+  function backendEligible(b) {
+    if ((COST_TIER_RANK[b.cost_tier] ?? 99) > costCeilingRank) return false;
+    if (minCaps.size > 0) {
+      const bCaps = new Set(b.capabilities || []);
+      for (const c of minCaps) if (!bCaps.has(c)) return false;
+    }
+    return true;
+  }
+
+  // ── Model selection within a backend ──────────────────────────────────────
+  function pickModel(backend, tier, preferSmall) {
+    const candidates = (backend.models || []).filter(m => m.tier === tier);
+    if (!candidates.length) return null;
+
+    const hot = hotModels[backend.id] || new Set();
+
+    // Prefer already-loaded model (zero warm-up cost).
+    const hotMatch = candidates.find(m => hot.has(m.id));
+    if (hotMatch) return hotMatch;
+
+    // Cold: sort by size_gb ascending; pick first (smallest) or last (largest).
+    const sorted = [...candidates].sort((a, b) => (a.size_gb || 0) - (b.size_gb || 0));
+    return preferSmall ? sorted[0] : sorted[sorted.length - 1];
+  }
+
+  // ── Walk preferred backends in priority order ──────────────────────────────
+  for (const bid of candidateIds) {
+    const backend = backendMap[bid];
+    if (!backend) continue;
+    if (!backendEligible(backend)) continue;
+
+    const model = pickModel(backend, targetTier, !escalated);
+    if (!model) continue;
+
+    const hot = (hotModels[backend.id] || new Set()).has(model.id);
+    return {
+      backendUrl: backend.url,
+      model:      model.id,
+      apiShape:   backend.type === "openai_compat" ? "openai" : null,
+      options:    {},
+      _routing_meta: {
+        complexity_estimate: complexity,
+        backend_id:          backend.id,
+        model_tier:          targetTier,
+        escalated,
+        hot,
+        stub: false,
+      },
+    };
+  }
+
+  // ── Fallback: legacy env-var defaults ─────────────────────────────────────
   return {
     backendUrl: process.env.OLLAMA_URL || persona?.ollama_base_url || "http://10.50.50.11:11434",
     model:      process.env.MODEL      || persona?.ollama_model    || "qwen2.5-coder:14b",
+    apiShape:   null,
     options:    {},
     _routing_meta: {
       complexity_estimate: complexity,
-      preferred_backends:  persona?.routing?.preferred_backends || [],
-      preferred_tier:      persona?.routing?.preferred_tier || "medium",
-      stub: true,
+      target_tier:         targetTier,
+      escalated,
+      fallback_reason:     "no_matching_backend",
+      stub:                false,
     },
   };
 }
