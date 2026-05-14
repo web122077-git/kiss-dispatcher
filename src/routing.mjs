@@ -18,7 +18,7 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BACKENDS_PATH = process.env.BACKENDS_PATH ||
-  join(__dirname, "../../persona-config/backends.json");
+  "/10310L/repos/persona-config/backends.json";
 
 // ── Keyword signals ───────────────────────────────────────────────────────────
 // Applied to lowercased title + description. Total clamped to [-1.5, +2].
