@@ -1,10 +1,11 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 
 // Read-only context-api + file tools available to all personas in Phase 2 T2a.
 // Per decision-tools-per-role-not-batch-2026-05-11: read tools inline; write/external
-// tools (svc-ansible-ssh, openbao, openclaw, file-write) stay in Phase 4 Track 2.
+// tools (openbao) stay for later. svc-ansible-ssh-mcp and openclaw-mcp landed Phase 4 Track 2.
 //
 // Phase 4 Track 2 first lander (T4 of openclaw-spike-zdev-2026-05, 2026-05-11):
 // openclaw_chat_async / openclaw_task_status / openclaw_task_cancel are added
@@ -203,6 +204,76 @@ export const TOOL_SCHEMAS = {
       }
     }
   },
+  // ── svc-ansible-ssh-mcp tools (Phase 4 Track 2) ───────────────────────────
+  // Each tool runs a fixed, allowlisted command on a named homelab host via SSH.
+  // The `host` slot is validated against the 18-host allowlist in allowlist.json.
+  ssh_ls: {
+    type: "function",
+    function: {
+      name: "ssh_ls",
+      description: "List a directory on a specific homelab host via SSH. host must be a known 10310 host name (e.g. '10310Aton'). path is restricted to alphanumeric, '.', '/', '-', '_'.",
+      parameters: { type: "object", properties: {
+        host: { type: "string", description: "Known homelab host name from the allowlist." },
+        path: { type: "string", description: "Absolute directory path to list." }
+      }, required: ["host", "path"] }
+    }
+  },
+  ssh_cat: {
+    type: "function",
+    function: {
+      name: "ssh_cat",
+      description: "Read a file on a specific homelab host via SSH. Output capped at 64 KiB. host must be a known 10310 host.",
+      parameters: { type: "object", properties: {
+        host: { type: "string" },
+        path: { type: "string", description: "Absolute file path to read." }
+      }, required: ["host", "path"] }
+    }
+  },
+  ssh_systemctl_status: {
+    type: "function",
+    function: {
+      name: "ssh_systemctl_status",
+      description: "Run systemctl status <unit> on a homelab host via SSH.",
+      parameters: { type: "object", properties: {
+        host: { type: "string" },
+        unit: { type: "string", description: "Systemd unit name (e.g. 'nginx.service')." }
+      }, required: ["host", "unit"] }
+    }
+  },
+  ssh_journalctl_unit: {
+    type: "function",
+    function: {
+      name: "ssh_journalctl_unit",
+      description: "Fetch recent journal entries for a unit on a homelab host.",
+      parameters: { type: "object", properties: {
+        host: { type: "string" },
+        unit: { type: "string" },
+        lines: { type: "integer", default: 50, description: "Number of lines (1–500)." }
+      }, required: ["host", "unit"] }
+    }
+  },
+  ssh_docker_ps: {
+    type: "function",
+    function: {
+      name: "ssh_docker_ps",
+      description: "List running containers on a homelab host via 'docker ps'.",
+      parameters: { type: "object", properties: {
+        host: { type: "string" }
+      }, required: ["host"] }
+    }
+  },
+  ssh_docker_logs: {
+    type: "function",
+    function: {
+      name: "ssh_docker_logs",
+      description: "Fetch tail logs from a docker container on a homelab host.",
+      parameters: { type: "object", properties: {
+        host: { type: "string" },
+        container: { type: "string", description: "Container name or id." },
+        n: { type: "integer", default: 50, description: "Number of lines (1–500)." }
+      }, required: ["host", "container"] }
+    }
+  },
 
   // ── Write-tier tools — require explicit approval before execution ─────────
   // x-requires-explicit-approval: true causes executeTool to file an
@@ -288,10 +359,10 @@ export function buildRoleTools(env) {
   // Write-tier additions — all behind the approval gate in executeTool.
   base.cpm    = [...base.cpm,    "agile_node_create","agile_node_patch"];
   base.pm     = [...base.pm,     "agile_node_create","agile_node_patch"];
-  base.tl     = [...base.tl,     "agile_node_patch"];
-  base.be     = [...base.be,     "agile_node_patch","file_write"];
+  base.tl     = [...base.tl,     "agile_node_patch", "ssh_ls", "ssh_cat"];
+  base.be     = [...base.be,     "agile_node_patch","file_write","ssh_ls","ssh_cat"];
   base.fe     = [...base.fe,     "agile_node_patch","file_write"];
-  base.do     = [...base.do,     "agile_node_patch","file_write"];
+  base.do     = [...base.do,     "agile_node_patch","file_write","ssh_ls","ssh_cat","ssh_systemctl_status","ssh_journalctl_unit","ssh_docker_ps","ssh_docker_logs"];
   base.doc    = [...base.doc,    "file_write"];
   base.closer = [...base.closer, "agile_node_create","agile_node_patch"];
   // Phase 4 Track 2: DO gets openclaw_* tools when OPENCLAW_MCP_URL is set.
@@ -526,6 +597,68 @@ async function openclawMcpCall(toolName, args, retry = 1) {
   }
 }
 
+
+// ── svc-ansible-ssh-mcp stdio bridge (Phase 4 Track 2) ─────────────────────
+// Spawns node svc-ansible-ssh-mcp as a subprocess per call (stdio JSON-RPC).
+// Fail-open: errors return { ok:false, error } so the dispatcher logs + continues.
+const SSH_MCP_BIN = process.env.SSH_MCP_BIN ||
+  "/home/svc-ansible/build/svc-ansible-ssh-mcp/dist/index.js";
+const SSH_MCP_ALLOWLIST_PATH = process.env.SSH_MCP_ALLOWLIST_PATH ||
+  "/home/svc-ansible/build/svc-ansible-ssh-mcp/allowlist.json";
+const SSH_MCP_KEY_PATH = process.env.SSH_MCP_KEY_PATH ||
+  "/home/svc-ansible/.ssh/svc_ansible";
+const SSH_MCP_TIMEOUT_MS = 20_000;
+
+async function sshMcpCall(toolName, args) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { proc.kill("SIGTERM"); } catch (_) {}
+      resolve(val);
+    };
+    const proc = spawn("node", [SSH_MCP_BIN], {
+      env: {
+        ...process.env,
+        SSH_ALLOWLIST_PATH: SSH_MCP_ALLOWLIST_PATH,
+        SSH_KEY_PATH: SSH_MCP_KEY_PATH,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const timer = setTimeout(() => settle({ ok: false, error: "sshMcp timeout" }), SSH_MCP_TIMEOUT_MS);
+    let buf = "";
+    let msgId = 1;
+    let phase = "init";
+    proc.stdout.on("data", (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (phase === "init" && msg.id === 1 && msg.result) {
+          phase = "call";
+          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
+          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: ++msgId, method: "tools/call", params: { name: toolName, arguments: args } }) + "\n");
+        } else if (phase === "call" && msg.id === msgId) {
+          if (msg.error) return settle({ ok: false, error: msg.error.message || String(msg.error) });
+          const content = msg.result?.content;
+          const text = Array.isArray(content) ? content.map(c => c.text || "").join("") : JSON.stringify(msg.result);
+          settle({ ok: true, output: text });
+        }
+      }
+    });
+    proc.stderr.on("data", () => {}); // suppress startup log
+    proc.on("error", (e) => settle({ ok: false, error: `sshMcp spawn error: ${e.message}` }));
+    proc.on("close", (code) => { if (!settled) settle({ ok: false, error: `sshMcp exited ${code}` }); });
+    proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msgId, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "kiss-dispatcher", version: "1.0" } } }) + "\n");
+  });
+}
+
 export const TOOL_EXECUTORS = {
   xray:    ({ name }) => ctxGet(`/xray/${encodeURIComponent(name)}`),
   nodes_q: ({ q })    => ctxGet(`/nodes?q=${encodeURIComponent(q)}`),
@@ -545,6 +678,12 @@ export const TOOL_EXECUTORS = {
   openclaw_chat_async:       (a)              => openclawMcpCall("openclaw_chat_async", a),
   openclaw_task_status:      (a)              => openclawMcpCall("openclaw_task_status", a),
   openclaw_task_cancel:      (a)              => openclawMcpCall("openclaw_task_cancel", a),
+  ssh_ls:                    (a) => sshMcpCall("ls", a),
+  ssh_cat:                   (a) => sshMcpCall("cat", a),
+  ssh_systemctl_status:      (a) => sshMcpCall("systemctl_status", a),
+  ssh_journalctl_unit:       (a) => sshMcpCall("journalctl_unit", a),
+  ssh_docker_ps:             (a) => sshMcpCall("docker_ps", a),
+  ssh_docker_logs:           (a) => sshMcpCall("docker_logs", a),
 
   // Write-tier executors — only reached after approval gate passes.
   agile_node_create: async ({ label, body }) => {
