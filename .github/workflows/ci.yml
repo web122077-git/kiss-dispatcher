@@ -3,9 +3,9 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
-    branches: [main, dev]
+    branches: [main]
 
 # Per ADR adr-ci-self-hosted-runner-conventions-2026-05-04: use the
 # homelab github-lxc runner (label: 10310github).
@@ -45,7 +45,7 @@ jobs:
       - name: Unit test — parser fallback (prompt-eng-pm-output-shape)
         run: node tests/parser-fallback.test.mjs
 
-      - name: Unit test — openclaw-tools allow-list gating (T4 openclaw-spike-zdev-2026-05)
+      - name: Unit test — openclaw-tools allow-list gating
         run: node tests/openclaw-tools.test.mjs
 
       - name: Unit test — complexityEstimate routing heuristic (T3 dispatcher-routing-abstraction-2026-05)
@@ -112,42 +112,3 @@ jobs:
             "sudo systemctl restart 'kiss-dispatcher@*.service' 2>&1 || true; sudo systemctl list-units 'kiss-dispatcher@*' --no-pager"
 
           echo "kiss-dispatcher@*.service restarted on Aton from /opt/kiss-dispatcher"
-
-  deploy-to-zdev:
-    runs-on: [self-hosted, zdev-github]
-    needs: smoke
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-    timeout-minutes: 15
-    concurrency:
-      group: deploy-zdev-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Deploy kiss-dispatcher to zdev-aton:/opt/kiss-dispatcher
-        run: |
-          retry() {
-            for i in 1 2 3; do
-              if "$@"; then return 0; fi
-              echo "Attempt ${i} failed, retrying in 5s..."
-              sleep 5
-            done
-            echo "ERROR: command failed after 3 attempts: $*"
-            return 1
-          }
-
-          retry rsync -avz --delete \
-            --exclude='.git' --exclude='node_modules' --exclude='tests' \
-            --exclude='package-lock.json' \
-            -e "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
-            ./ svc-ansible@10.98.98.10:/opt/kiss-dispatcher/
-
-          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes svc-ansible@10.98.98.10 \
-            "cd /opt/kiss-dispatcher && npm install --production 2>&1 | tail -5"
-
-          # zdev-aton may not have kiss-dispatcher@*.service units installed yet.
-          # Restart anything that IS active; do not fail if no units exist.
-          retry ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o BatchMode=yes svc-ansible@10.98.98.10 \
-            "sudo systemctl restart 'kiss-dispatcher@*.service' 2>&1 || true; sudo systemctl list-units 'kiss-dispatcher@*' --no-pager 2>&1 || echo 'no kiss-dispatcher@*.service on zdev-aton yet'"
-
-          echo "kiss-dispatcher synced to zdev-aton:/opt/kiss-dispatcher (restart best-effort)"
