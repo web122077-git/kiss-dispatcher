@@ -80,12 +80,6 @@ async function ensureWorkerNode() {
   return await r.json();
 }
 
-async function getTaskStatus(taskId) {
-  const r = await fetch(`${CTX_API}/agile/task/${encodeURIComponent(taskId)}`);
-  if (!r.ok) return null;
-  const j = await r.json();
-  return j.status;
-}
 
 async function patchTask(taskId, body) {
   const r = await fetch(`${CTX_API}/agile/task/${taskId}`, {
