@@ -99,8 +99,10 @@ export async function chatWithTools({ ollamaUrl, model, messages, tools, options
       conv.push({
         role: "tool",
         content: typeof result === "string" ? result : JSON.stringify(result),
-        // tool_call_id / name vary per backend; Ollama accepts a plain tool message
+        // OpenAI/LiteLLM correlate tool results by tool_call_id; native Ollama uses name.
+        // Set both so the message is valid on either backend (C-2: dispatcher -> LiteLLM).
         name,
+        ...(useOpenAI && tc.id ? { tool_call_id: tc.id } : {}),
       });
     }
   }
